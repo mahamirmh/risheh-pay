@@ -14,7 +14,7 @@ def test_happy_path_transitions_are_allowed() -> None:
         OrderState.PROCESSING,
         OrderState.DELIVERED,
     ]
-    for current, target in zip(path, path[1:], strict=True):
+    for current, target in zip(path, path[1:]):
         assert_transition(current, target)
 
 
