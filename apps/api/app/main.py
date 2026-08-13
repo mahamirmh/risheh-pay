@@ -1,4 +1,8 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from redis.asyncio import Redis
+from sqlalchemy import text
+
+from app.db import engine, settings
 
 app = FastAPI(
     title="Risheh Digital Goods API",
@@ -15,5 +19,24 @@ async def health() -> dict[str, str]:
 
 @app.get("/ready", tags=["operations"])
 async def readiness() -> dict[str, str]:
-    # DB/Redis/provider dependency checks will be added as each dependency lands.
-    return {"status": "ready"}
+    checks: dict[str, str] = {}
+
+    try:
+        async with engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+        checks["database"] = "ok"
+    except Exception as exc:
+        checks["database"] = "error"
+        raise HTTPException(status_code=503, detail={"status": "not_ready", "checks": checks}) from exc
+
+    redis = Redis.from_url(settings.redis_url, decode_responses=True)
+    try:
+        await redis.ping()
+        checks["redis"] = "ok"
+    except Exception as exc:
+        checks["redis"] = "error"
+        raise HTTPException(status_code=503, detail={"status": "not_ready", "checks": checks}) from exc
+    finally:
+        await redis.aclose()
+
+    return {"status": "ready", **checks}
