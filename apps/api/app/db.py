@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://postgres:postgres@postgres:5432/risheh_digital_goods"
+    redis_url: str = "redis://redis:6379/0"
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
