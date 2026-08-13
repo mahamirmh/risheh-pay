@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from redis.asyncio import Redis
 from sqlalchemy import text
 
@@ -7,6 +8,13 @@ from app.db import SessionLocal, engine, settings
 from app.seed import seed_demo_catalog
 
 app = FastAPI(title="Risheh Digital Goods API", version="0.2.0", docs_url="/docs", redoc_url=None)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.include_router(api_router)
 
 
