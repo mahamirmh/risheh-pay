@@ -2,55 +2,70 @@
 
 پلتفرم هوشمند فروش و تحویل آنی محصولات دیجیتال بین‌المللی.
 
-## 🎯 هدف پروژه
+## وضعیت فعلی
 
-Risheh Digital Goods یک پلتفرم Mobile-First برای خرید محصولات دیجیتال مانند:
+- ✅ Next.js storefront در `apps/web`
+- ✅ FastAPI backend در `apps/api`
+- ✅ PostgreSQL + Redis در Docker Compose
+- ✅ `/health` برای liveness
+- ✅ `/ready` برای بررسی واقعی PostgreSQL و Redis
+- ✅ CI برای API و Web
+- ✅ تنظیمات Vercel برای deploy فرانت‌اند
 
-- Apple Gift Card
-- Google Play
-- PlayStation
-- Xbox
-- Amazon
-- سایر Digital Goods
+## Core Flow
 
-است که فرآیند خرید را از انتخاب محصول تا پرداخت و تحویل کد، به‌صورت خودکار مدیریت می‌کند.
+Customer → Product Selection → Availability Check → Rial Pricing → Payment → Payment Verification → Provider API → Automatic Fulfillment → Instant Digital Delivery
 
-## ⚡ Core Flow
-
-Customer  
-→ Product Selection  
-→ Availability Check  
-→ Rial Pricing  
-→ Payment  
-→ Payment Verification  
-→ Provider API  
-→ Automatic Fulfillment  
-→ Instant Digital Delivery
-
-## 🛡 Transaction-Safe Architecture
-
-یکی از اصول اصلی پروژه این است:
+## Transaction-Safe Architecture
 
 > Payment Success ≠ Order Delivered
 
-پرداخت و تحویل محصول دو مرحله مستقل هستند و سیستم باید Failure، Retry، Refund و Provider Failover را مدیریت کند.
+پرداخت و تحویل دو مرحله مستقل هستند و سیستم باید Failure، Retry، Refund و Provider Failover را مدیریت کند.
 
-## 🏗 Planned Stack
+## Repository Structure
 
-- Next.js
-- TypeScript
-- Tailwind CSS
-- FastAPI
-- Python
+```text
+apps/
+├── api/       # FastAPI, PostgreSQL, Redis, fulfillment/payment adapters
+└── web/       # Next.js mobile-first storefront
+
+.github/workflows/
+├── api-ci.yml
+└── web-ci.yml
+```
+
+## Local Development
+
+### Full stack
+
+```bash
+docker compose up --build
+```
+
+API: `http://localhost:8000`  
+Swagger: `http://localhost:8000/docs`
+
+### Web
+
+```bash
+cd apps/web
+npm install
+npm run dev
+```
+
+Web: `http://localhost:3000`
+
+## Vercel
+
+برای پروژه Vercel، Root Directory را روی `apps/web` قرار بده. فایل `vercel.json` نیز build/install را برای همین workspace تنظیم کرده است.
+
+## Stack
+
+- Next.js + TypeScript
+- FastAPI + Python
 - PostgreSQL
 - Redis
 - Docker
 - GitHub Actions
 
-## 🚧 Status
-
-Project initialization and architecture phase.
-
----
-
-Built by Risheh Digital
+Built by Risheh Digital.
