@@ -3,10 +3,17 @@ from redis.asyncio import Redis
 from sqlalchemy import text
 
 from app.api import router as api_router
-from app.db import engine, settings
+from app.db import SessionLocal, engine, settings
+from app.seed import seed_demo_catalog
 
 app = FastAPI(title="Risheh Digital Goods API", version="0.2.0", docs_url="/docs", redoc_url=None)
 app.include_router(api_router)
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    async with SessionLocal() as session:
+        await seed_demo_catalog(session)
 
 
 @app.get("/health", tags=["operations"])
@@ -24,7 +31,6 @@ async def readiness() -> dict[str, str]:
     except Exception as exc:
         checks["database"] = "error"
         raise HTTPException(status_code=503, detail={"status": "not_ready", "checks": checks}) from exc
-
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
     try:
         await redis.ping()
