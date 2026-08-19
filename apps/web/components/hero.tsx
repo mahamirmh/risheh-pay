@@ -11,20 +11,21 @@ const TRUST = [
 export function Hero() {
   return (
     <section className="relative overflow-hidden">
-      <div className="grain absolute inset-0 opacity-60" aria-hidden />
+      <div className="grain absolute inset-0 opacity-40" aria-hidden />
       <div
-        className="absolute -top-32 right-0 size-[380px] rounded-full bg-primary/15 blur-3xl"
+        className="absolute -top-40 left-1/2 size-[520px] -translate-x-1/2 rounded-full bg-primary/10 blur-3xl"
         aria-hidden
       />
-      <div className="relative mx-auto w-full max-w-6xl px-4 pb-8 pt-12 md:px-6 md:pb-12 md:pt-20">
+      <div className="relative mx-auto flex w-full max-w-4xl flex-col items-center px-4 pb-10 pt-14 text-center md:px-6 md:pb-16 md:pt-24">
         <Badge variant="primary" className="animate-fade-up">
           زیرساخت تحویل محصولات دیجیتال
         </Badge>
         <h1
-          className="mt-5 max-w-3xl text-balance text-4xl font-black leading-[1.1] tracking-tight animate-fade-up md:text-6xl"
+          className="mt-6 text-balance text-4xl font-bold leading-[1.08] tracking-tight animate-fade-up md:text-[3.75rem]"
           style={{ animationDelay: "60ms" }}
         >
           گیفت‌کارت و اشتراک بین‌المللی،
+          <br className="hidden md:block" />
           <span className="text-primary"> آنی و مطمئن</span>.
         </h1>
         <p
@@ -36,13 +37,13 @@ export function Hero() {
         </p>
 
         <dl
-          className="mt-9 grid grid-cols-2 gap-3 animate-fade-up md:grid-cols-4"
+          className="mt-10 grid w-full grid-cols-2 gap-3 animate-fade-up md:grid-cols-4"
           style={{ animationDelay: "180ms" }}
         >
           {TRUST.map(({ icon: Icon, title, desc }) => (
             <div
               key={title}
-              className="rounded-2xl border border-border bg-card/60 p-4"
+              className="rounded-2xl bg-card p-4 text-right shadow-[0_1px_2px_rgba(0,0,0,0.04),0_8px_24px_-12px_rgba(0,0,0,0.08)] ring-1 ring-border/60"
             >
               <Icon className="size-5 text-primary" aria-hidden />
               <dt className="mt-3 text-sm font-bold">{title}</dt>

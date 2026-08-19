@@ -22,6 +22,20 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+def _do_run_migrations(connection) -> None:
+    context.configure(connection=connection, target_metadata=target_metadata)
+    # This transaction wrapper is required, not decorative: without it,
+    # `alembic upgrade head` exits 0 and prints nothing wrong, but every DDL
+    # statement it just ran gets silently rolled back the moment the
+    # surrounding connection closes, leaving the database completely
+    # untouched. Configuring the context and running migrations must also
+    # happen in the *same* run_sync call - splitting them across two
+    # separate connection.run_sync() calls (as this previously did) hands
+    # each one its own transactional context, so nothing here ever commits.
+    with context.begin_transaction():
+        context.run_migrations()
+
+
 async def run_async_migrations() -> None:
     connectable = async_engine_from_config(
         config.get_section(config.config_ini_section, {}),
@@ -29,10 +43,7 @@ async def run_async_migrations() -> None:
         poolclass=pool.NullPool,
     )
     async with connectable.connect() as connection:
-        await connection.run_sync(
-            lambda conn: context.configure(connection=conn, target_metadata=target_metadata)
-        )
-        await connection.run_sync(lambda _: context.run_migrations())
+        await connection.run_sync(_do_run_migrations)
     await connectable.dispose()
 
 

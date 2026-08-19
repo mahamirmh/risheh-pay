@@ -39,10 +39,10 @@ export function ProductCard({
     group.variants.find((v) => v.id === selectedId) ?? group.variants[0];
 
   return (
-    <article className="group flex flex-col rounded-3xl border border-border bg-card p-5 transition-colors hover:border-primary/40">
+    <article className="group flex flex-col rounded-[28px] bg-card p-5 shadow-[0_1px_2px_rgba(0,0,0,0.04),0_10px_28px_-14px_rgba(0,0,0,0.10)] ring-1 ring-border/60 transition-all hover:-translate-y-0.5 hover:shadow-[0_2px_6px_rgba(0,0,0,0.05),0_20px_36px_-14px_rgba(0,0,0,0.14)] hover:ring-primary/30">
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-3">
-          <span className="grid size-12 shrink-0 place-items-center rounded-2xl border border-border bg-muted/60 font-mono text-sm font-bold text-foreground">
+          <span className="grid size-12 shrink-0 place-items-center rounded-2xl bg-muted font-mono text-sm font-bold text-foreground ring-1 ring-border/60">
             {monogram(group.brand)}
           </span>
           <div className="min-w-0">

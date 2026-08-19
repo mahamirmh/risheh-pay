@@ -7,7 +7,17 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://postgres:postgres@postgres:5432/risheh_digital_goods"
     redis_url: str = "redis://redis:6379/0"
-    cors_origins: list[str] = ["*"]
+    # Explicit allow-list. "*" must never be combined with allow_credentials=True
+    # (browsers reject the combination outright, and it is unsafe besides) -
+    # see app/main.py.
+    cors_origins: list[str] = ["http://localhost:3000"]
+    # Server-held key gating the admin router (app/admin.py). Unset by default
+    # so admin endpoints are refused (503) rather than silently open.
+    admin_api_key: str | None = None
+    # Key material for encrypting digital delivery secrets at rest (see
+    # app/security/crypto.py). Must be set outside source control in any
+    # environment that performs real fulfillment.
+    delivery_encryption_key: str | None = None
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

@@ -18,7 +18,16 @@ order_state = sa.Enum(
 
 
 def upgrade() -> None:
-    order_state.create(op.get_bind(), checkfirst=True)
+    # `order_state` is used below only as the type of orders.state.
+    # SQLAlchemy's CREATE TABLE compiler already emits (checkfirst-guarded)
+    # CREATE TYPE for a Postgres ENUM column the first time a table using it
+    # is created - a *separate*, eagerly-run `order_state.create(bind,
+    # checkfirst=True)` here as well would run its own independent
+    # checkfirst check, see the type does not exist yet, and then race the
+    # CREATE TABLE below to create it a second time, failing with
+    # "type orderstate already exists" on every fresh database. That
+    # actually happened here; don't reintroduce the standalone .create()
+    # call.
     op.create_table("products",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
         sa.Column("brand", sa.String(120), nullable=False),
