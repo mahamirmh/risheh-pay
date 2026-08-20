@@ -1,0 +1,2627 @@
+From 55295d4ea862acc576149c547a906e8801a8a717 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 19 Aug 2026 19:55:17 +0000
+Subject: [PATCH] Fix checkout/migration bugs, add RBAC + rate limiting,
+ redesign storefront
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Backend fixes:
+- Wire the existing order state machine + row locking into the checkout
+  API; /orders/{id}/pay was mutating order.state directly with no locking
+  and no idempotency guard, so a retried call could double-purchase from
+  the provider or double-refund.
+- Fix POST /orders returning payment.checkout_url, an attribute that does
+  not exist on PaymentIntent (the field is payment_url) - every order
+  creation crashed with AttributeError against the real (non-demo) API.
+  No test exercised the actual HTTP endpoint, so this had never been
+  caught.
+- Fix alembic: CREATE TYPE orderstate was emitted twice on a fresh
+  database (once from an explicit .create(checkfirst=True) call, again
+  implicitly while compiling CREATE TABLE orders), failing every clean
+  `alembic upgrade head`. Separately, env.py's async migration runner
+  split context.configure()/run_migrations() across two connection.run_sync
+  calls with no context.begin_transaction() wrapper, so on success the
+  whole migration silently rolled back (exit 0, empty database). Fixed
+  both against a real Postgres instance.
+- Fix CORS: allow_origins=["*"] + allow_credentials=True is a combination
+  browsers refuse to honor; now an explicit allow-list with credentials
+  off (nothing here uses cookies).
+- Encrypt DigitalDelivery.encrypted_payload at rest (Fernet, keyed by
+  DELIVERY_ENCRYPTION_KEY) instead of storing the gift-card secret in
+  plaintext, and audit every reveal - both required by docs/SECURITY.md
+  but unimplemented.
+- Add an API-key-gated admin router (orders, audit log, variant
+  enable/disable) and a public /api/v1/categories endpoint + category
+  filter on /api/v1/products - the PRD's Admin scope and category
+  discovery existed only on paper.
+- Add Redis-backed rate limiting on quotes/orders/pay/order-read
+  (fail-open if Redis is unreachable, so it can't take down checkout).
+- New apps/api/tests/test_api_integration.py drives the real HTTP
+  endpoints end-to-end (idempotent pay, encryption at rest, admin auth,
+  category filtering) instead of only the service layer underneath them.
+
+Frontend fixes + redesign:
+- app/page.tsx was still the pre-Tailwind prototype: classnames like
+  .hero/.card/.button/.checkout don't exist anywhere, so the storefront
+  rendered unstyled. Meanwhile a complete, accessible component system
+  (Hero, SiteHeader, ProductGrid/ProductCard, CheckoutSheet, Countdown,
+  OrderTimeline, DeliveryReveal) plus lib/api.ts's demo-mode fallback sat
+  entirely unused. Rewired page.tsx to compose the real components.
+- Redesigned the token layer toward an Apple.com-like language: near-white
+  canvas, near-black text, one confident blue for anything actionable,
+  pill-shaped primary CTAs, hairline borders + soft elevation instead of
+  heavy borders, centered hero. Verified by screenshot in demo mode
+  through the full purchase flow.
+- Added category tabs (گیفت‌کارت/اشتراک/بازی/نرم‌افزار) above the existing
+  brand filter in ProductGrid - the PRD explicitly lists category
+  discovery as required customer scope; only brand filtering existed.
+- Upgraded Next 14.2.32 -> 15.5.23 and React 18 -> 19: npm audit showed
+  several disclosed high-severity DoS advisories on the old range whose
+  fixes only land in the 15.5.x line. This app has no dynamic routes,
+  server actions, or cookies/headers usage, so migration risk was low;
+  verified via tsc, a clean install, and a rendered smoke test. Added an
+  npm override to also patch Next's bundled internal postcss.
+- Added a Content-Security-Policy header (present in intent per
+  docs/SECURITY.md, absent in next.config.mjs).
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RevyXu8dorZDi8Arp7JCFp
+---
+ .env.example                           |   4 +
+ .github/workflows/api-ci.yml           |  10 +
+ .gitignore                             |   2 +
+ apps/api/alembic/env.py                |  19 +-
+ apps/api/alembic/versions/0001_core.py |  11 +-
+ apps/api/app/admin.py                  |  87 +++
+ apps/api/app/api.py                    | 205 +++++-
+ apps/api/app/db.py                     |  12 +-
+ apps/api/app/main.py                   |  13 +-
+ apps/api/app/security/__init__.py      |   0
+ apps/api/app/security/admin.py         |  28 +
+ apps/api/app/security/crypto.py        |  50 ++
+ apps/api/app/security/rate_limit.py    |  50 ++
+ apps/api/pyproject.toml                |   1 +
+ apps/api/tests/test_api_integration.py | 163 +++++
+ apps/web/app/globals.css               |  51 +-
+ apps/web/app/layout.tsx                |   2 +-
+ apps/web/app/manifest.ts               |   4 +-
+ apps/web/app/page.tsx                  |  71 +-
+ apps/web/components/hero.tsx           |  13 +-
+ apps/web/components/product-card.tsx   |   4 +-
+ apps/web/components/product-grid.tsx   |  96 ++-
+ apps/web/components/ui/button.tsx      |  24 +-
+ apps/web/next-env.d.ts                 |   3 +-
+ apps/web/next.config.mjs               |  25 +
+ apps/web/package-lock.json             | 866 ++++++++++++++++++-------
+ apps/web/package.json                  |  13 +-
+ 27 files changed, 1451 insertions(+), 376 deletions(-)
+ create mode 100644 apps/api/app/admin.py
+ create mode 100644 apps/api/app/security/__init__.py
+ create mode 100644 apps/api/app/security/admin.py
+ create mode 100644 apps/api/app/security/crypto.py
+ create mode 100644 apps/api/app/security/rate_limit.py
+ create mode 100644 apps/api/tests/test_api_integration.py
+
+diff --git a/.env.example b/.env.example
+index b37e1ef..154f4f8 100644
+--- a/.env.example
++++ b/.env.example
+@@ -18,6 +18,10 @@ PAYMENT_SECRET=
+ PAYMENT_CALLBACK_URL=http://localhost:8000/api/v1/payments/callback
+ 
+ # Delivery encryption key must be generated securely outside source control.
++# Any long random string works (it is hashed into a Fernet key internally).
+ DELIVERY_ENCRYPTION_KEY=
+ 
++# Gates /api/v1/admin/*. Leave unset to keep admin endpoints disabled (503).
++ADMIN_API_KEY=
++
+ SENTRY_DSN=
+diff --git a/.github/workflows/api-ci.yml b/.github/workflows/api-ci.yml
+index 2c42958..9521958 100644
+--- a/.github/workflows/api-ci.yml
++++ b/.github/workflows/api-ci.yml
+@@ -28,8 +28,18 @@ jobs:
+           --health-interval 5s
+           --health-timeout 5s
+           --health-retries 10
++      redis:
++        image: redis:7-alpine
++        ports:
++          - 6379:6379
++        options: >-
++          --health-cmd "redis-cli ping"
++          --health-interval 5s
++          --health-timeout 3s
++          --health-retries 10
+     env:
+       DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/risheh_digital_goods
++      REDIS_URL: redis://localhost:6379/0
+     defaults:
+       run:
+         working-directory: apps/api
+diff --git a/.gitignore b/.gitignore
+index 1b74419..825ea3d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -13,6 +13,7 @@ __pycache__/
+ .ruff_cache/
+ .venv/
+ venv/
++*.egg-info/
+ 
+ # Node
+ node_modules/
+@@ -20,6 +21,7 @@ node_modules/
+ dist/
+ build/
+ coverage/
++*.tsbuildinfo
+ 
+ # IDE / OS
+ .DS_Store
+diff --git a/apps/api/alembic/env.py b/apps/api/alembic/env.py
+index d73eeb8..b3f16ac 100644
+--- a/apps/api/alembic/env.py
++++ b/apps/api/alembic/env.py
+@@ -22,6 +22,20 @@ def run_migrations_offline() -> None:
+         context.run_migrations()
+ 
+ 
++def _do_run_migrations(connection) -> None:
++    context.configure(connection=connection, target_metadata=target_metadata)
++    # This transaction wrapper is required, not decorative: without it,
++    # `alembic upgrade head` exits 0 and prints nothing wrong, but every DDL
++    # statement it just ran gets silently rolled back the moment the
++    # surrounding connection closes, leaving the database completely
++    # untouched. Configuring the context and running migrations must also
++    # happen in the *same* run_sync call - splitting them across two
++    # separate connection.run_sync() calls (as this previously did) hands
++    # each one its own transactional context, so nothing here ever commits.
++    with context.begin_transaction():
++        context.run_migrations()
++
++
+ async def run_async_migrations() -> None:
+     connectable = async_engine_from_config(
+         config.get_section(config.config_ini_section, {}),
+@@ -29,10 +43,7 @@ async def run_async_migrations() -> None:
+         poolclass=pool.NullPool,
+     )
+     async with connectable.connect() as connection:
+-        await connection.run_sync(
+-            lambda conn: context.configure(connection=conn, target_metadata=target_metadata)
+-        )
+-        await connection.run_sync(lambda _: context.run_migrations())
++        await connection.run_sync(_do_run_migrations)
+     await connectable.dispose()
+ 
+ 
+diff --git a/apps/api/alembic/versions/0001_core.py b/apps/api/alembic/versions/0001_core.py
+index 5d8dfda..b371789 100644
+--- a/apps/api/alembic/versions/0001_core.py
++++ b/apps/api/alembic/versions/0001_core.py
+@@ -18,7 +18,16 @@ order_state = sa.Enum(
+ 
+ 
+ def upgrade() -> None:
+-    order_state.create(op.get_bind(), checkfirst=True)
++    # `order_state` is used below only as the type of orders.state.
++    # SQLAlchemy's CREATE TABLE compiler already emits (checkfirst-guarded)
++    # CREATE TYPE for a Postgres ENUM column the first time a table using it
++    # is created - a *separate*, eagerly-run `order_state.create(bind,
++    # checkfirst=True)` here as well would run its own independent
++    # checkfirst check, see the type does not exist yet, and then race the
++    # CREATE TABLE below to create it a second time, failing with
++    # "type orderstate already exists" on every fresh database. That
++    # actually happened here; don't reintroduce the standalone .create()
++    # call.
+     op.create_table("products",
+         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+         sa.Column("brand", sa.String(120), nullable=False),
+diff --git a/apps/api/app/admin.py b/apps/api/app/admin.py
+new file mode 100644
+index 0000000..3589a7d
+--- /dev/null
++++ b/apps/api/app/admin.py
+@@ -0,0 +1,87 @@
++"""Operator/admin endpoints.
++
++Gated by `require_admin` (see app/security/admin.py). Covers the slice of
++the PRD's Admin scope needed to actually operate the MVP day-to-day:
++inspecting orders, reading the audit trail, and enabling/disabling catalog
++variants. Full per-operator accounts + granular roles are future work
++(tracked as the "Identity & access" domain in docs/ARCHITECTURE.md); this
++gives the operator scope real access control today instead of none.
++"""
++
++from __future__ import annotations
++
++import uuid
++
++from fastapi import APIRouter, Depends, HTTPException
++from sqlalchemy import select
++from sqlalchemy.ext.asyncio import AsyncSession
++
++from app.db import get_db
++from app.models import AuditLog, Order, ProductVariant
++from app.security.admin import require_admin
++
++router = APIRouter(prefix="/api/v1/admin", tags=["admin"], dependencies=[Depends(require_admin)])
++
++
++@router.get("/orders")
++async def list_orders(limit: int = 50, db: AsyncSession = Depends(get_db)) -> list[dict]:
++    limit = max(1, min(limit, 200))
++    rows = (
++        await db.execute(select(Order).order_by(Order.created_at.desc()).limit(limit))
++    ).scalars().all()
++    return [
++        {
++            "id": str(order.id),
++            "state": order.state.value,
++            "correlation_id": order.correlation_id,
++            "created_at": order.created_at,
++            "updated_at": order.updated_at,
++        }
++        for order in rows
++    ]
++
++
++@router.get("/audit-log")
++async def list_audit_log(limit: int = 100, db: AsyncSession = Depends(get_db)) -> list[dict]:
++    limit = max(1, min(limit, 500))
++    rows = (
++        await db.execute(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(limit))
++    ).scalars().all()
++    return [
++        {
++            "id": str(entry.id),
++            "correlation_id": entry.correlation_id,
++            "actor": entry.actor,
++            "event": entry.event,
++            "payload": entry.payload,
++            "created_at": entry.created_at,
++        }
++        for entry in rows
++    ]
++
++
++@router.post("/variants/{variant_id}/enable")
++async def enable_variant(variant_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
++    return await _set_variant_enabled(db, variant_id, True)
++
++
++@router.post("/variants/{variant_id}/disable")
++async def disable_variant(variant_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
++    return await _set_variant_enabled(db, variant_id, False)
++
++
++async def _set_variant_enabled(db: AsyncSession, variant_id: uuid.UUID, enabled: bool) -> dict:
++    variant = await db.get(ProductVariant, variant_id)
++    if not variant:
++        raise HTTPException(status_code=404, detail="Variant not found")
++    variant.enabled = enabled
++    db.add(
++        AuditLog(
++            correlation_id=f"admin-{variant.id}",
++            actor="admin",
++            event="variant_enabled" if enabled else "variant_disabled",
++            payload={"variant_id": str(variant.id)},
++        )
++    )
++    await db.commit()
++    return {"id": str(variant.id), "enabled": variant.enabled}
+diff --git a/apps/api/app/api.py b/apps/api/app/api.py
+index a323d9b..8d75110 100644
+--- a/apps/api/app/api.py
++++ b/apps/api/app/api.py
+@@ -5,18 +5,56 @@ from decimal import Decimal
+ from fastapi import APIRouter, Depends, HTTPException
+ from pydantic import BaseModel, Field
+ from sqlalchemy import select
++from sqlalchemy.exc import IntegrityError
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+-from app.db import get_db
+-from app.models import DigitalDelivery, Order, OrderState, Payment, Product, ProductVariant, Quote
++from app.db import get_db, settings
++from app.fulfillment.service import fulfill
++from app.models import (
++    AuditLog,
++    DigitalDelivery,
++    Order,
++    OrderState,
++    Payment,
++    Product,
++    ProductVariant,
++    Quote,
++)
++from app.orders.repository import OrderNotFound, get_order_for_update, transition_order
++from app.orders.state_machine import InvalidOrderTransition
+ from app.payments.mock import MockPaymentProvider
+ from app.pricing.service import calculate_price
+ from app.providers.mock import MockDigitalGoodsProvider
++from app.refunds.service import recover_payment
++from app.security.crypto import (
++    DeliveryEncryptionNotConfigured,
++    decrypt_delivery_secret,
++    encrypt_delivery_secret,
++)
++from app.security.rate_limit import rate_limit
+ 
+ router = APIRouter(prefix="/api/v1")
+ payment_provider = MockPaymentProvider()
+ goods_provider = MockDigitalGoodsProvider()
+ 
++# Order states in which /pay has already run (successfully or not) and must
++# not be re-executed. Calling /pay again on one of these is a no-op that
++# returns the current state, so retried client requests (double taps, flaky
++# networks) can never double-charge or re-purchase from the provider.
++_PAY_ALREADY_HANDLED = frozenset(
++    {
++        OrderState.PAID,
++        OrderState.FULFILLMENT_PENDING,
++        OrderState.PROCESSING,
++        OrderState.RETRYING,
++        OrderState.RECONCILIATION_REQUIRED,
++        OrderState.FULFILLMENT_FAILED,
++        OrderState.REFUND_PENDING,
++        OrderState.REFUNDED,
++        OrderState.DELIVERED,
++    }
++)
++
+ 
+ class QuoteRequest(BaseModel):
+     variant_id: uuid.UUID
+@@ -30,13 +68,16 @@ class CheckoutRequest(BaseModel):
+ 
+ 
+ @router.get("/products")
+-async def products(db: AsyncSession = Depends(get_db)) -> list[dict]:
+-    rows = (await db.execute(
++async def products(category: str | None = None, db: AsyncSession = Depends(get_db)) -> list[dict]:
++    query = (
+         select(Product, ProductVariant)
+         .join(ProductVariant, Product.id == ProductVariant.product_id)
+         .where(ProductVariant.enabled.is_(True))
+         .order_by(Product.brand, Product.name, ProductVariant.denomination)
+-    )).all()
++    )
++    if category:
++        query = query.where(Product.category == category)
++    rows = (await db.execute(query)).all()
+     return [
+         {
+             "id": str(variant.id), "product_id": str(product.id),
+@@ -48,7 +89,24 @@ async def products(db: AsyncSession = Depends(get_db)) -> list[dict]:
+     ]
+ 
+ 
+-@router.post("/quotes")
++@router.get("/categories")
++async def categories(db: AsyncSession = Depends(get_db)) -> list[dict]:
++    """Distinct categories with an enabled, purchasable variant - powers
++    storefront category navigation (PRD: "search/category/brand discovery")."""
++    rows = (
++        await db.execute(
++            select(Product.category, ProductVariant.id)
++            .join(ProductVariant, Product.id == ProductVariant.product_id)
++            .where(ProductVariant.enabled.is_(True))
++        )
++    ).all()
++    counts: dict[str, int] = {}
++    for category, _variant_id in rows:
++        counts[category] = counts.get(category, 0) + 1
++    return [{"category": category, "product_count": count} for category, count in sorted(counts.items())]
++
++
++@router.post("/quotes", dependencies=[rate_limit("quotes", limit=30, window_seconds=60)])
+ async def create_quote(payload: QuoteRequest, db: AsyncSession = Depends(get_db)) -> dict:
+     variant = await db.get(ProductVariant, payload.variant_id)
+     if not variant or not variant.enabled:
+@@ -71,7 +129,7 @@ async def create_quote(payload: QuoteRequest, db: AsyncSession = Depends(get_db)
+     return {"id": str(quote.id), "amount": str(quote.final_amount), "currency": quote.currency, "expires_at": quote.expires_at}
+ 
+ 
+-@router.post("/orders")
++@router.post("/orders", dependencies=[rate_limit("orders", limit=20, window_seconds=60)])
+ async def create_order(payload: CheckoutRequest, db: AsyncSession = Depends(get_db)) -> dict:
+     quote = await db.get(Quote, payload.quote_id)
+     if not quote or quote.expires_at <= datetime.now(timezone.utc):
+@@ -81,40 +139,139 @@ async def create_order(payload: CheckoutRequest, db: AsyncSession = Depends(get_
+         return {"id": str(existing.id), "state": existing.state.value, "correlation_id": existing.correlation_id}
+     order = Order(quote_id=quote.id, state=OrderState.PAYMENT_PENDING, correlation_id=f"rg-{uuid.uuid4().hex[:20]}")
+     db.add(order)
+-    await db.flush()
++    try:
++        await db.flush()
++    except IntegrityError:
++        # Two concurrent requests raced on the same quote_id; the unique
++        # constraint on orders.quote_id caught it. Return the winner's order
++        # instead of surfacing a 500 to the loser.
++        await db.rollback()
++        existing = (await db.execute(select(Order).where(Order.quote_id == quote.id))).scalar_one_or_none()
++        if existing:
++            return {"id": str(existing.id), "state": existing.state.value, "correlation_id": existing.correlation_id}
++        raise
+     payment = await payment_provider.create_payment(order_id=str(order.id), amount=quote.final_amount, idempotency_key=str(order.id))
+     db.add(Payment(order_id=order.id, provider="mock", idempotency_key=str(order.id), provider_reference=payment.reference, amount=quote.final_amount, status=payment.status))
++    db.add(
++        AuditLog(
++            correlation_id=order.correlation_id,
++            actor="system",
++            event="order_created",
++            payload={"order_id": str(order.id), "quote_id": str(quote.id), "state": order.state.value},
++        )
++    )
+     await db.commit()
+-    return {"id": str(order.id), "state": order.state.value, "correlation_id": order.correlation_id, "payment_url": payment.checkout_url, "payment_reference": payment.reference, "amount": str(quote.final_amount), "currency": quote.currency}
++    return {"id": str(order.id), "state": order.state.value, "correlation_id": order.correlation_id, "payment_url": payment.payment_url, "payment_reference": payment.reference, "amount": str(quote.final_amount), "currency": quote.currency}
++
+ 
++def _order_response(order: Order, delivery: str | None = None) -> dict:
++    return {"id": str(order.id), "state": order.state.value, "correlation_id": order.correlation_id, "delivery": delivery}
+ 
+-@router.post("/orders/{order_id}/pay")
++
++@router.post("/orders/{order_id}/pay", dependencies=[rate_limit("pay", limit=10, window_seconds=60)])
+ async def pay_order(order_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+-    order = await db.get(Order, order_id)
+-    if not order:
+-        raise HTTPException(status_code=404, detail="Order not found")
++    try:
++        order = await get_order_for_update(db, order_id)
++    except OrderNotFound as exc:
++        raise HTTPException(status_code=404, detail="Order not found") from exc
++
++    if order.state in _PAY_ALREADY_HANDLED:
++        # Idempotent: a retried/duplicated call must never re-verify payment
++        # or re-purchase from the provider. Just report where the order is.
++        delivery = (
++            await db.execute(select(DigitalDelivery).where(DigitalDelivery.order_id == order.id))
++        ).scalar_one_or_none()
++        secret = None
++        if delivery is not None and order.state == OrderState.DELIVERED:
++            secret = _reveal(db, delivery, order, actor="customer")
++            await db.commit()
++        return _order_response(order, secret)
++
++    if order.state != OrderState.PAYMENT_PENDING:
++        raise HTTPException(status_code=409, detail=f"Order is not payable from state {order.state.value}")
++
+     quote = await db.get(Quote, order.quote_id)
+     payment = (await db.execute(select(Payment).where(Payment.order_id == order.id))).scalar_one()
+     verification = await payment_provider.verify(reference=payment.provider_reference or "", expected_amount=quote.final_amount)
+     if verification.status != "paid":
+         raise HTTPException(status_code=402, detail="Payment verification failed")
+     payment.status = "paid"
+-    order.state = OrderState.PAID
+-    purchase = await goods_provider.purchase("mock-apple-us", quote.provider_cost, idempotency_key=str(order.id))
+-    if purchase.status != "delivered":
+-        order.state = OrderState.FULFILLMENT_FAILED
+-        await db.commit()
+-        raise HTTPException(status_code=502, detail="Fulfillment failed")
+-    order.state = OrderState.DELIVERED
+-    db.add(DigitalDelivery(order_id=order.id, encrypted_payload=purchase.delivery_secret or ""))
++
++    await transition_order(db, order_id=order.id, target=OrderState.PAID, actor="payment_gateway", event="payment_verified")
++    await transition_order(db, order_id=order.id, target=OrderState.FULFILLMENT_PENDING, actor="system", event="fulfillment_enqueued")
++    await transition_order(db, order_id=order.id, target=OrderState.PROCESSING, actor="system", event="fulfillment_started")
++
++    decision = await fulfill(
++        provider=goods_provider,
++        external_product_id="mock-apple-us",
++        amount=quote.provider_cost,
++        idempotency_key=f"fulfill:{order.id}",
++    )
++
++    try:
++        order = await transition_order(db, order_id=order.id, target=decision.state, actor="system", event="fulfillment_decision")
++    except InvalidOrderTransition as exc:
++        raise HTTPException(status_code=500, detail="Unexpected fulfillment outcome") from exc
++
++    secret: str | None = None
++    if decision.state == OrderState.DELIVERED and decision.purchase and decision.purchase.delivery_secret:
++        encrypted = encrypt_delivery_secret(decision.purchase.delivery_secret, key=settings.delivery_encryption_key)
++        delivery = DigitalDelivery(order_id=order.id, encrypted_payload=encrypted)
++        db.add(delivery)
++        await db.flush()
++        secret = _reveal(db, delivery, order, actor="customer")
++    elif decision.state == OrderState.FULFILLMENT_FAILED:
++        # Money was taken but the provider could not deliver: recover it
++        # automatically instead of leaving a paid, undelivered order stuck.
++        refund = await recover_payment(
++            payment_provider=payment_provider,
++            payment_reference=payment.provider_reference or "",
++            amount=payment.amount,
++            order_id=str(order.id),
++        )
++        order = await transition_order(db, order_id=order.id, target=OrderState.REFUND_PENDING, actor="system", event="refund_initiated")
++        order = await transition_order(
++            db, order_id=order.id, target=OrderState.REFUNDED, actor="payment_gateway", event="refund_confirmed"
++        )
++        db.add(
++            AuditLog(
++                correlation_id=order.correlation_id,
++                actor="system",
++                event="refund_completed",
++                payload={"order_id": str(order.id), "refund_reference": refund.reference, "reason": decision.reason},
++            )
++        )
++
+     await db.commit()
+-    return {"id": str(order.id), "state": order.state.value, "delivery": purchase.delivery_secret}
++    return _order_response(order, secret)
++
++
++def _reveal(db: AsyncSession, delivery: DigitalDelivery, order: Order, *, actor: str) -> str:
++    """Decrypt a delivery secret for an authorized read and audit the reveal
++    (SECURITY.md: "Audit code reveal/access events")."""
++    try:
++        secret = decrypt_delivery_secret(delivery.encrypted_payload, key=settings.delivery_encryption_key)
++    except (DeliveryEncryptionNotConfigured, ValueError) as exc:
++        raise HTTPException(status_code=500, detail="Delivery could not be decrypted") from exc
++    db.add(
++        AuditLog(
++            correlation_id=order.correlation_id,
++            actor=actor,
++            event="delivery_revealed",
++            payload={"order_id": str(order.id)},
++        )
++    )
++    return secret
+ 
+ 
+-@router.get("/orders/{order_id}")
++@router.get("/orders/{order_id}", dependencies=[rate_limit("order_read", limit=60, window_seconds=60)])
+ async def get_order(order_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+     order = await db.get(Order, order_id)
+     if not order:
+         raise HTTPException(status_code=404, detail="Order not found")
+     delivery = (await db.execute(select(DigitalDelivery).where(DigitalDelivery.order_id == order.id))).scalar_one_or_none()
+-    return {"id": str(order.id), "state": order.state.value, "correlation_id": order.correlation_id, "delivery": delivery.encrypted_payload if delivery else None}
++    secret = None
++    if delivery is not None and order.state == OrderState.DELIVERED:
++        secret = _reveal(db, delivery, order, actor="customer")
++        await db.commit()
++    return _order_response(order, secret)
+diff --git a/apps/api/app/db.py b/apps/api/app/db.py
+index a2fee3d..34b83e4 100644
+--- a/apps/api/app/db.py
++++ b/apps/api/app/db.py
+@@ -7,7 +7,17 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
+ class Settings(BaseSettings):
+     database_url: str = "postgresql+asyncpg://postgres:postgres@postgres:5432/risheh_digital_goods"
+     redis_url: str = "redis://redis:6379/0"
+-    cors_origins: list[str] = ["*"]
++    # Explicit allow-list. "*" must never be combined with allow_credentials=True
++    # (browsers reject the combination outright, and it is unsafe besides) -
++    # see app/main.py.
++    cors_origins: list[str] = ["http://localhost:3000"]
++    # Server-held key gating the admin router (app/admin.py). Unset by default
++    # so admin endpoints are refused (503) rather than silently open.
++    admin_api_key: str | None = None
++    # Key material for encrypting digital delivery secrets at rest (see
++    # app/security/crypto.py). Must be set outside source control in any
++    # environment that performs real fulfillment.
++    delivery_encryption_key: str | None = None
+     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+ 
+ 
+diff --git a/apps/api/app/main.py b/apps/api/app/main.py
+index df4ae92..9c46cee 100644
+--- a/apps/api/app/main.py
++++ b/apps/api/app/main.py
+@@ -3,19 +3,26 @@ from fastapi.middleware.cors import CORSMiddleware
+ from redis.asyncio import Redis
+ from sqlalchemy import text
+ 
++from app.admin import router as admin_router
+ from app.api import router as api_router
+ from app.db import SessionLocal, engine, settings
+ from app.seed import seed_demo_catalog
+ 
+ app = FastAPI(title="Risheh Digital Goods API", version="0.2.0", docs_url="/docs", redoc_url=None)
++# No cookie-based auth is used anywhere in this API (admin auth is a header
++# API key, see app/security/admin.py), so credentials never need to cross
++# origins. Keeping allow_credentials off lets cors_origins stay a plain
++# allow-list without risking the invalid/insecure "*" + credentials
++# combination that browsers refuse to honor anyway.
+ app.add_middleware(
+     CORSMiddleware,
+     allow_origins=settings.cors_origins,
+-    allow_credentials=True,
+-    allow_methods=["*"],
+-    allow_headers=["*"],
++    allow_credentials=False,
++    allow_methods=["GET", "POST"],
++    allow_headers=["Content-Type", "X-Admin-Api-Key"],
+ )
+ app.include_router(api_router)
++app.include_router(admin_router)
+ 
+ 
+ @app.on_event("startup")
+diff --git a/apps/api/app/security/__init__.py b/apps/api/app/security/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/apps/api/app/security/admin.py b/apps/api/app/security/admin.py
+new file mode 100644
+index 0000000..b47e6f5
+--- /dev/null
++++ b/apps/api/app/security/admin.py
+@@ -0,0 +1,28 @@
++"""Minimal RBAC gate for operator/admin endpoints.
++
++The PRD defines an Admin scope (catalog enable/disable, orders, audit log)
++and SECURITY.md requires RBAC on admin functions, but no identity/access
++domain exists yet in this MVP. Until real accounts + roles ship, admin
++endpoints are gated behind a single server-held API key supplied via the
++`X-Admin-Api-Key` header. This is intentionally simple and easy to replace
++with per-operator accounts later without changing calling conventions.
++"""
++
++from __future__ import annotations
++
++import hmac
++
++from fastapi import Header, HTTPException
++
++from app.db import settings
++
++
++async def require_admin(x_admin_api_key: str | None = Header(default=None)) -> None:
++    configured = settings.admin_api_key
++    if not configured:
++        raise HTTPException(
++            status_code=503,
++            detail="Admin access is not configured on this deployment.",
++        )
++    if not x_admin_api_key or not hmac.compare_digest(x_admin_api_key, configured):
++        raise HTTPException(status_code=401, detail="Invalid or missing admin credentials")
+diff --git a/apps/api/app/security/crypto.py b/apps/api/app/security/crypto.py
+new file mode 100644
+index 0000000..614e240
+--- /dev/null
++++ b/apps/api/app/security/crypto.py
+@@ -0,0 +1,50 @@
++"""Encryption at rest for digital delivery secrets.
++
++SECURITY.md requires gift-card codes to be encrypted at rest using an
++application-managed key stored outside the database. This wraps Fernet
++(AES128-CBC + HMAC) keyed from `settings.delivery_encryption_key`.
++
++`digital_deliveries.encrypted_payload` never contains a raw code once this
++module is used; only `decrypt_delivery_secret` (called from an authorized,
++audited read path) turns it back into plaintext.
++"""
++
++from __future__ import annotations
++
++import base64
++import hashlib
++
++from cryptography.fernet import Fernet, InvalidToken
++
++
++class DeliveryEncryptionNotConfigured(RuntimeError):
++    pass
++
++
++def _derive_fernet_key(secret: str) -> bytes:
++    """Accept any non-empty secret (not necessarily a valid Fernet key) and
++    derive a stable, correctly-formatted 32-byte urlsafe-base64 Fernet key
++    from it, so operators can set a plain random string in the environment
++    instead of having to pre-generate a Fernet-specific key."""
++    digest = hashlib.sha256(secret.encode("utf-8")).digest()
++    return base64.urlsafe_b64encode(digest)
++
++
++def _fernet(key: str | None) -> Fernet:
++    if not key:
++        raise DeliveryEncryptionNotConfigured(
++            "DELIVERY_ENCRYPTION_KEY is not set; refusing to store or read "
++            "digital delivery secrets in plaintext."
++        )
++    return Fernet(_derive_fernet_key(key))
++
++
++def encrypt_delivery_secret(plaintext: str, *, key: str | None) -> str:
++    return _fernet(key).encrypt(plaintext.encode("utf-8")).decode("ascii")
++
++
++def decrypt_delivery_secret(ciphertext: str, *, key: str | None) -> str:
++    try:
++        return _fernet(key).decrypt(ciphertext.encode("ascii")).decode("utf-8")
++    except InvalidToken as exc:
++        raise ValueError("delivery payload could not be decrypted") from exc
+diff --git a/apps/api/app/security/rate_limit.py b/apps/api/app/security/rate_limit.py
+new file mode 100644
+index 0000000..b068c18
+--- /dev/null
++++ b/apps/api/app/security/rate_limit.py
+@@ -0,0 +1,50 @@
++"""Redis-backed fixed-window rate limiting.
++
++SECURITY.md requires rate limiting on auth, checkout, payment and reveal
++endpoints; none existed. This is a small, dependency-injectable limiter
++keyed by client IP + route, using a single INCR/EXPIRE round trip per
++request so it stays cheap on the hot checkout path.
++"""
++
++from __future__ import annotations
++
++from fastapi import Depends, HTTPException, Request
++from redis.asyncio import Redis
++
++from app.db import settings
++
++_redis: Redis | None = None
++
++
++def _client() -> Redis:
++    global _redis
++    if _redis is None:
++        _redis = Redis.from_url(settings.redis_url, decode_responses=True)
++    return _redis
++
++
++def rate_limit(key_prefix: str, *, limit: int, window_seconds: int):
++    """Return a FastAPI dependency enforcing `limit` requests per
++    `window_seconds` per client IP for the given logical route."""
++
++    async def _dependency(request: Request) -> None:
++        client_ip = request.client.host if request.client else "unknown"
++        key = f"ratelimit:{key_prefix}:{client_ip}"
++        redis = _client()
++        try:
++            current = await redis.incr(key)
++            if current == 1:
++                await redis.expire(key, window_seconds)
++        except Exception:
++            # Fail open: Redis being unavailable must not take down checkout.
++            # Availability of the purchase flow matters more than the limiter
++            # itself, and the state machine + idempotency keys already bound
++            # the damage a burst of requests can do.
++            return
++        if current > limit:
++            raise HTTPException(
++                status_code=429,
++                detail="Too many requests. Please wait a moment and try again.",
++            )
++
++    return Depends(_dependency)
+diff --git a/apps/api/pyproject.toml b/apps/api/pyproject.toml
+index 8180c70..e63145f 100644
+--- a/apps/api/pyproject.toml
++++ b/apps/api/pyproject.toml
+@@ -15,6 +15,7 @@ dependencies = [
+   "asyncpg>=0.30,<1.0",
+   "redis>=6.4,<7.0",
+   "alembic>=1.16,<2.0",
++  "cryptography>=43.0,<44.0",
+ ]
+ 
+ [project.optional-dependencies]
+diff --git a/apps/api/tests/test_api_integration.py b/apps/api/tests/test_api_integration.py
+new file mode 100644
+index 0000000..9897dc7
+--- /dev/null
++++ b/apps/api/tests/test_api_integration.py
+@@ -0,0 +1,163 @@
++"""HTTP-level integration tests against a real (test) database.
++
++The service-layer unit tests elsewhere in this suite exercise
++`app/fulfillment/service.py`, `app/orders/state_machine.py`, etc. directly,
++but nothing previously called the actual HTTP endpoints in `app/api.py` -
++which is how a real attribute-name bug (`payment.checkout_url` instead of
++`payment.payment_url`) shipped: every single `/orders` call crashed with an
++AttributeError, and no test caught it. These tests drive the endpoints
++end-to-end instead.
++"""
++
++from decimal import Decimal
++
++import pytest
++from httpx import ASGITransport, AsyncClient
++
++from app.db import SessionLocal, engine, settings
++from app.main import app
++from app.models import Base, Product, ProductVariant
++
++
++@pytest.fixture(autouse=True)
++async def _schema():
++    async with engine.begin() as conn:
++        await conn.run_sync(Base.metadata.create_all)
++    yield
++    async with engine.begin() as conn:
++        await conn.run_sync(Base.metadata.drop_all)
++    # `engine` is a module-level singleton (app/db.py) reused across every
++    # test, but pytest-asyncio gives each test function its own event loop
++    # by default. Pooled connections opened under one test's loop are
++    # unusable (and error noisily on teardown) once that loop closes, so
++    # dispose the pool after each test and let the next test open fresh
++    # connections under its own loop.
++    await engine.dispose()
++
++
++@pytest.fixture(autouse=True)
++def _configure_secrets(monkeypatch):
++    """Encryption and admin-auth are refused (not silently insecure) unless
++    configured; give the test suite deterministic values regardless of the
++    environment it runs in."""
++    monkeypatch.setattr(settings, "delivery_encryption_key", "test-only-key-do-not-use-in-prod")
++    monkeypatch.setattr(settings, "admin_api_key", "test-admin-key")
++
++
++async def _seed_variant() -> str:
++    async with SessionLocal() as session:
++        product = Product(brand="TestBrand", name="Test Gift Card", category="gift_card")
++        session.add(product)
++        await session.flush()
++        variant = ProductVariant(
++            product_id=product.id,
++            country_code="US",
++            currency="USD",
++            denomination=Decimal("25"),
++            enabled=True,
++        )
++        session.add(variant)
++        await session.commit()
++        await session.refresh(variant)
++        return str(variant.id)
++
++
++@pytest.mark.asyncio
++async def test_full_checkout_flow_is_idempotent_and_returns_payment_url() -> None:
++    variant_id = await _seed_variant()
++    transport = ASGITransport(app=app)
++    async with AsyncClient(transport=transport, base_url="http://test") as client:
++        quote_resp = await client.post("/api/v1/quotes", json={"variant_id": variant_id})
++        assert quote_resp.status_code == 200
++        quote = quote_resp.json()
++
++        order_resp = await client.post("/api/v1/orders", json={"quote_id": quote["id"]})
++        assert order_resp.status_code == 200
++        order = order_resp.json()
++        # Regression test for the payment_url/checkout_url attribute-name
++        # bug: this response field must be present and populated.
++        assert order["payment_url"].startswith("https://mock.invalid/pay/")
++
++        pay_resp = await client.post(f"/api/v1/orders/{order['id']}/pay")
++        assert pay_resp.status_code == 200
++        paid = pay_resp.json()
++        assert paid["state"] == "DELIVERED"
++        assert paid["delivery"] == "MOCK-CODE-NOT-REDEEMABLE"
++
++        # Idempotency: a duplicated /pay call (retry, double tap) must not
++        # re-verify payment or re-purchase from the provider - it just
++        # reports the order's current state.
++        pay_again = await client.post(f"/api/v1/orders/{order['id']}/pay")
++        assert pay_again.status_code == 200
++        assert pay_again.json()["state"] == "DELIVERED"
++
++        order_after = await client.get(f"/api/v1/orders/{order['id']}")
++        assert order_after.json()["state"] == "DELIVERED"
++
++
++@pytest.mark.asyncio
++async def test_delivery_secret_is_encrypted_at_rest() -> None:
++    variant_id = await _seed_variant()
++    transport = ASGITransport(app=app)
++    async with AsyncClient(transport=transport, base_url="http://test") as client:
++        quote = (await client.post("/api/v1/quotes", json={"variant_id": variant_id})).json()
++        order = (await client.post("/api/v1/orders", json={"quote_id": quote["id"]})).json()
++        await client.post(f"/api/v1/orders/{order['id']}/pay")
++
++    from sqlalchemy import select
++
++    from app.models import DigitalDelivery
++
++    async with SessionLocal() as session:
++        delivery = (
++            await session.execute(
++                select(DigitalDelivery).where(DigitalDelivery.order_id == order["id"])
++            )
++        ).scalar_one()
++        assert delivery.encrypted_payload != "MOCK-CODE-NOT-REDEEMABLE"
++        assert "MOCK-CODE-NOT-REDEEMABLE" not in delivery.encrypted_payload
++
++
++@pytest.mark.asyncio
++async def test_admin_endpoints_require_the_configured_api_key() -> None:
++    transport = ASGITransport(app=app)
++    async with AsyncClient(transport=transport, base_url="http://test") as client:
++        unauthenticated = await client.get("/api/v1/admin/orders")
++        assert unauthenticated.status_code == 401
++
++        wrong_key = await client.get(
++            "/api/v1/admin/orders", headers={"X-Admin-Api-Key": "not-the-right-key"}
++        )
++        assert wrong_key.status_code == 401
++
++        authorized = await client.get(
++            "/api/v1/admin/orders", headers={"X-Admin-Api-Key": "test-admin-key"}
++        )
++        assert authorized.status_code == 200
++
++
++@pytest.mark.asyncio
++async def test_admin_endpoints_are_disabled_when_no_key_is_configured(monkeypatch) -> None:
++    monkeypatch.setattr(settings, "admin_api_key", None)
++    transport = ASGITransport(app=app)
++    async with AsyncClient(transport=transport, base_url="http://test") as client:
++        response = await client.get(
++            "/api/v1/admin/orders", headers={"X-Admin-Api-Key": "anything"}
++        )
++        assert response.status_code == 503
++
++
++@pytest.mark.asyncio
++async def test_products_can_be_filtered_by_category() -> None:
++    variant_id = await _seed_variant()
++    transport = ASGITransport(app=app)
++    async with AsyncClient(transport=transport, base_url="http://test") as client:
++        gift_cards = await client.get("/api/v1/products", params={"category": "gift_card"})
++        assert gift_cards.status_code == 200
++        assert any(p["id"] == variant_id for p in gift_cards.json())
++
++        other = await client.get("/api/v1/products", params={"category": "subscription"})
++        assert other.json() == []
++
++        categories = await client.get("/api/v1/categories")
++        assert {"category": "gift_card", "product_count": 1} in categories.json()
+diff --git a/apps/web/app/globals.css b/apps/web/app/globals.css
+index a483298..bcf735e 100644
+--- a/apps/web/app/globals.css
++++ b/apps/web/app/globals.css
+@@ -4,34 +4,38 @@
+ 
+ @layer base {
+   :root {
+-    --background: 205 55% 6%;
+-    --foreground: 200 20% 96%;
++    /* Apple.com-style palette: near-white canvas, near-black ink, a single
++       confident blue for anything actionable, hairline borders instead of
++       heavy ones. Optimized for a checkout flow - the price and the buy
++       button should always read as the highest-contrast things on screen. */
++    --background: 210 20% 98%;
++    --foreground: 240 6% 12%;
+ 
+-    --card: 205 42% 10%;
+-    --card-foreground: 200 20% 96%;
++    --card: 0 0% 100%;
++    --card-foreground: 240 6% 12%;
+ 
+-    --muted: 205 30% 16%;
+-    --muted-foreground: 202 15% 62%;
++    --muted: 220 16% 95%;
++    --muted-foreground: 220 9% 43%;
+ 
+-    --primary: 162 68% 46%;
+-    --primary-foreground: 165 60% 8%;
++    --primary: 211 100% 45%;
++    --primary-foreground: 0 0% 100%;
+ 
+-    --accent: 41 90% 62%;
+-    --accent-foreground: 40 60% 10%;
++    --accent: 27 96% 53%;
++    --accent-foreground: 0 0% 100%;
+ 
+-    --border: 202 30% 20%;
+-    --ring: 162 68% 46%;
++    --border: 220 14% 90%;
++    --ring: 211 100% 45%;
+ 
+-    --destructive: 358 62% 52%;
+-    --destructive-foreground: 355 30% 96%;
++    --destructive: 4 77% 46%;
++    --destructive-foreground: 0 0% 100%;
+ 
+-    --success: 152 58% 46%;
+-    --success-foreground: 155 60% 8%;
++    --success: 142 71% 32%;
++    --success-foreground: 0 0% 100%;
+ 
+-    --warning: 38 88% 58%;
+-    --warning-foreground: 40 60% 10%;
++    --warning: 32 95% 44%;
++    --warning-foreground: 0 0% 100%;
+ 
+-    --radius: 1rem;
++    --radius: 1.25rem;
+   }
+ }
+ 
+@@ -54,8 +58,13 @@
+   body {
+     @apply bg-background text-foreground antialiased;
+     font-feature-settings: "ss01";
+-    /* Use system font stack to avoid missing-font regressions from the Tailwind migration */
+-    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Color Emoji", "Apple Color Emoji";
++    /* `--font-vazir` is the self-hosted Vazirmatn variable set on <html> in
++       app/layout.tsx via next/font. It must lead this stack - a previous
++       version of this rule hardcoded a system-only font-family here that
++       shadowed it completely, so the loaded Persian typeface was never
++       actually applied to any Farsi text on the site despite being
++       downloaded on every page load. */
++    font-family: var(--font-vazir), ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Color Emoji", "Apple Color Emoji";
+   }
+ 
+   a {
+diff --git a/apps/web/app/layout.tsx b/apps/web/app/layout.tsx
+index 8d2fe35..6cd7158 100644
+--- a/apps/web/app/layout.tsx
++++ b/apps/web/app/layout.tsx
+@@ -27,7 +27,7 @@ export const viewport: Viewport = {
+   initialScale: 1,
+   maximumScale: 1,
+   userScalable: false,
+-  themeColor: "#07131f",
++  themeColor: "#fbfbfd",
+ };
+ 
+ export default function RootLayout({
+diff --git a/apps/web/app/manifest.ts b/apps/web/app/manifest.ts
+index 6fd2727..ed91518 100644
+--- a/apps/web/app/manifest.ts
++++ b/apps/web/app/manifest.ts
+@@ -7,8 +7,8 @@ export default function manifest(): MetadataRoute.Manifest {
+     description: "خرید و تحویل آنی محصولات دیجیتال بین‌المللی",
+     start_url: "/",
+     display: "standalone",
+-    background_color: "#07131f",
+-    theme_color: "#07131f",
++    background_color: "#fbfbfd",
++    theme_color: "#fbfbfd",
+     lang: "fa",
+     dir: "rtl",
+     icons: [],
+diff --git a/apps/web/app/page.tsx b/apps/web/app/page.tsx
+index 8f86472..9bc27dc 100644
+--- a/apps/web/app/page.tsx
++++ b/apps/web/app/page.tsx
+@@ -1,55 +1,38 @@
+ "use client";
+ 
+ import { useEffect, useState } from "react";
+-
+-type Product = { id: string; name: string; country_code: string; currency: string; denomination: string };
+-type Order = { id: string; state: string; delivery?: string | null };
+-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
++import { getProducts, isDemoMode, type Product } from "@/lib/api";
++import { SiteHeader } from "@/components/site-header";
++import { Hero } from "@/components/hero";
++import { ProductGrid } from "@/components/product-grid";
++import { CheckoutSheet } from "@/components/checkout-sheet";
+ 
+ export default function Home() {
+   const [products, setProducts] = useState<Product[]>([]);
+-  const [selected, setSelected] = useState<Product | null>(null);
+-  const [order, setOrder] = useState<Order | null>(null);
+-  const [busy, setBusy] = useState(false);
+-  const [error, setError] = useState("");
++  const [demo, setDemo] = useState(false);
++  const [checkoutVariant, setCheckoutVariant] = useState<Product | null>(null);
+ 
+   useEffect(() => {
+-    fetch(`${API}/api/v1/products`).then(r => r.json()).then(setProducts).catch(() => setError("API در دسترس نیست؛ ابتدا Backend را اجرا کنید."));
++    getProducts().then((items) => {
++      setProducts(items);
++      setDemo(isDemoMode());
++    });
+   }, []);
+ 
+-  async function buy() {
+-    if (!selected) return;
+-    setBusy(true); setError("");
+-    try {
+-      const q = await fetch(`${API}/api/v1/quotes`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ variant_id: selected.id }) });
+-      if (!q.ok) throw new Error("دریافت Quote ناموفق بود");
+-      const quote = await q.json();
+-      const r = await fetch(`${API}/api/v1/orders`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ quote_id: quote.id }) });
+-      if (!r.ok) throw new Error("ساخت سفارش ناموفق بود");
+-      setOrder(await r.json());
+-    } catch (e) { setError(e instanceof Error ? e.message : "خطای سفارش"); }
+-    finally { setBusy(false); }
+-  }
+-
+-  async function pay() {
+-    if (!order) return;
+-    setBusy(true); setError("");
+-    try {
+-      const r = await fetch(`${API}/api/v1/orders/${order.id}/pay`, { method: "POST" });
+-      if (!r.ok) throw new Error("تأیید پرداخت ناموفق بود");
+-      setOrder(await r.json());
+-    } catch (e) { setError(e instanceof Error ? e.message : "خطای پرداخت"); }
+-    finally { setBusy(false); }
+-  }
+-
+-  return <main dir="rtl"><section className="hero"><div className="container">
+-    <nav className="nav"><div className="brand">ریشه / DIGITAL GOODS</div><div className="badge">MVP • Checkout Live</div></nav>
+-    <div className="grid">
+-      <div className="card"><div className="badge">Digital Goods Infrastructure</div><h1>خرید دیجیتال،<br />سریع و مطمئن.</h1><p className="lead">قیمت‌گذاری ریالی، Quote منقضی‌شونده، پرداخت idempotent و تحویل خودکار؛ از انتخاب تا Delivery در یک جریان کنترل‌شده.</p><div className="actions"><a className="button" href="#products">انتخاب محصول</a><a className="button secondary" href={`${API}/docs`} target="_blank">API Docs</a></div>{error && <div className="error">{error}</div>}</div>
+-      <div className="card" id="products"><div className="badge">محصولات منتخب</div><div className="products">{products.map(p => <button className={`product ${selected?.id === p.id ? "selected" : ""}`} key={p.id} onClick={() => setSelected(p)}><strong>{p.name}</strong><span>{p.country_code} • {p.denomination} {p.currency}</span><b>انتخاب</b></button>)}</div>
+-        {selected && <div className="checkout"><div><small>انتخاب شما</small><strong>{selected.name} — {selected.denomination} {selected.currency}</strong></div><button className="button" disabled={busy} onClick={buy}>{busy ? "در حال پردازش…" : "ایجاد سفارش"}</button></div>}
+-        {order && <div className="order"><div><small>Order</small><strong>وضعیت: {order.state}</strong></div>{order.state === "PAYMENT_PENDING" && <button className="button" disabled={busy} onClick={pay}>پرداخت آزمایشی</button>}{order.delivery && <div className="delivery"><small>تحویل دیجیتال</small><code>{order.delivery}</code></div>}</div>}
+-      </div>
+-    </div>
+-  </div></section><footer className="footer container">Risheh Digital • Transaction-safe digital delivery</footer></main>;
++  return (
++    <main dir="rtl">
++      <SiteHeader demo={demo} />
++      <Hero />
++      <ProductGrid products={products} onBuy={setCheckoutVariant} />
++      <footer className="border-t border-border/60 py-8 text-center text-xs text-muted-foreground">
++        ریشه دیجیتال — تحویل امن و آنی محصولات دیجیتال
++      </footer>
++      {checkoutVariant && (
++        <CheckoutSheet
++          variant={checkoutVariant}
++          onClose={() => setCheckoutVariant(null)}
++        />
++      )}
++    </main>
++  );
+ }
+diff --git a/apps/web/components/hero.tsx b/apps/web/components/hero.tsx
+index 8b5cae8..8a1d79d 100644
+--- a/apps/web/components/hero.tsx
++++ b/apps/web/components/hero.tsx
+@@ -11,20 +11,21 @@ const TRUST = [
+ export function Hero() {
+   return (
+     <section className="relative overflow-hidden">
+-      <div className="grain absolute inset-0 opacity-60" aria-hidden />
++      <div className="grain absolute inset-0 opacity-40" aria-hidden />
+       <div
+-        className="absolute -top-32 right-0 size-[380px] rounded-full bg-primary/15 blur-3xl"
++        className="absolute -top-40 left-1/2 size-[520px] -translate-x-1/2 rounded-full bg-primary/10 blur-3xl"
+         aria-hidden
+       />
+-      <div className="relative mx-auto w-full max-w-6xl px-4 pb-8 pt-12 md:px-6 md:pb-12 md:pt-20">
++      <div className="relative mx-auto flex w-full max-w-4xl flex-col items-center px-4 pb-10 pt-14 text-center md:px-6 md:pb-16 md:pt-24">
+         <Badge variant="primary" className="animate-fade-up">
+           زیرساخت تحویل محصولات دیجیتال
+         </Badge>
+         <h1
+-          className="mt-5 max-w-3xl text-balance text-4xl font-black leading-[1.1] tracking-tight animate-fade-up md:text-6xl"
++          className="mt-6 text-balance text-4xl font-bold leading-[1.08] tracking-tight animate-fade-up md:text-[3.75rem]"
+           style={{ animationDelay: "60ms" }}
+         >
+           گیفت‌کارت و اشتراک بین‌المللی،
++          <br className="hidden md:block" />
+           <span className="text-primary"> آنی و مطمئن</span>.
+         </h1>
+         <p
+@@ -36,13 +37,13 @@ export function Hero() {
+         </p>
+ 
+         <dl
+-          className="mt-9 grid grid-cols-2 gap-3 animate-fade-up md:grid-cols-4"
++          className="mt-10 grid w-full grid-cols-2 gap-3 animate-fade-up md:grid-cols-4"
+           style={{ animationDelay: "180ms" }}
+         >
+           {TRUST.map(({ icon: Icon, title, desc }) => (
+             <div
+               key={title}
+-              className="rounded-2xl border border-border bg-card/60 p-4"
++              className="rounded-2xl bg-card p-4 text-right shadow-[0_1px_2px_rgba(0,0,0,0.04),0_8px_24px_-12px_rgba(0,0,0,0.08)] ring-1 ring-border/60"
+             >
+               <Icon className="size-5 text-primary" aria-hidden />
+               <dt className="mt-3 text-sm font-bold">{title}</dt>
+diff --git a/apps/web/components/product-card.tsx b/apps/web/components/product-card.tsx
+index 01850ed..8d5304c 100644
+--- a/apps/web/components/product-card.tsx
++++ b/apps/web/components/product-card.tsx
+@@ -39,10 +39,10 @@ export function ProductCard({
+     group.variants.find((v) => v.id === selectedId) ?? group.variants[0];
+ 
+   return (
+-    <article className="group flex flex-col rounded-3xl border border-border bg-card p-5 transition-colors hover:border-primary/40">
++    <article className="group flex flex-col rounded-[28px] bg-card p-5 shadow-[0_1px_2px_rgba(0,0,0,0.04),0_10px_28px_-14px_rgba(0,0,0,0.10)] ring-1 ring-border/60 transition-all hover:-translate-y-0.5 hover:shadow-[0_2px_6px_rgba(0,0,0,0.05),0_20px_36px_-14px_rgba(0,0,0,0.14)] hover:ring-primary/30">
+       <div className="flex items-start justify-between gap-3">
+         <div className="flex items-center gap-3">
+-          <span className="grid size-12 shrink-0 place-items-center rounded-2xl border border-border bg-muted/60 font-mono text-sm font-bold text-foreground">
++          <span className="grid size-12 shrink-0 place-items-center rounded-2xl bg-muted font-mono text-sm font-bold text-foreground ring-1 ring-border/60">
+             {monogram(group.brand)}
+           </span>
+           <div className="min-w-0">
+diff --git a/apps/web/components/product-grid.tsx b/apps/web/components/product-grid.tsx
+index efeac1c..58e488e 100644
+--- a/apps/web/components/product-grid.tsx
++++ b/apps/web/components/product-grid.tsx
+@@ -1,8 +1,9 @@
+ "use client";
+ 
+-import { useMemo, useState } from "react";
++import { useEffect, useMemo, useState } from "react";
+ import type { Product } from "@/lib/api";
+ import { ProductCard, type ProductGroup } from "@/components/product-card";
++import { categoryLabel } from "@/lib/format";
+ import { cn } from "@/lib/utils";
+ 
+ function groupProducts(products: Product[]): ProductGroup[] {
+@@ -38,51 +39,102 @@ export function ProductGrid({
+   onBuy: (variant: Product) => void;
+ }) {
+   const groups = useMemo(() => groupProducts(products), [products]);
+-  const brands = useMemo(
+-    () => ["همه", ...Array.from(new Set(groups.map((g) => g.brand)))],
++
++  // Category is the primary browsing axis (PRD: "search/category/brand
++  // discovery"); brand is a secondary filter scoped to whatever category is
++  // selected, so a customer never sees a brand chip with zero results in it.
++  const categories = useMemo(
++    () => ["همه", ...Array.from(new Set(groups.map((g) => g.category)))],
+     [groups],
+   );
++  const [category, setCategory] = useState("همه");
++  const byCategory = useMemo(
++    () => (category === "همه" ? groups : groups.filter((g) => g.category === category)),
++    [groups, category],
++  );
++
++  const brands = useMemo(
++    () => ["همه", ...Array.from(new Set(byCategory.map((g) => g.brand)))],
++    [byCategory],
++  );
+   const [brand, setBrand] = useState("همه");
++  useEffect(() => {
++    if (!brands.includes(brand)) setBrand("همه");
++  }, [brands, brand]);
+ 
+   const visible =
+-    brand === "همه" ? groups : groups.filter((g) => g.brand === brand);
++    brand === "همه" ? byCategory : byCategory.filter((g) => g.brand === brand);
+ 
+   return (
+     <section id="products" className="mx-auto w-full max-w-6xl px-4 pb-24 md:px-6">
+-      <div className="flex flex-col gap-4 border-b border-border/60 pb-5 sm:flex-row sm:items-end sm:justify-between">
++      <div className="border-b border-border/60 pb-5">
+         <div>
+-          <h2 className="text-2xl font-black tracking-tight">فروشگاه</h2>
++          <h2 className="text-2xl font-bold tracking-tight">فروشگاه</h2>
+           <p className="mt-1 text-sm text-muted-foreground">
+             {groups.length} محصول آماده تحویل آنی
+           </p>
+         </div>
+-        <div className="-mx-4 overflow-x-auto px-4 sm:mx-0 sm:px-0">
+-          <div className="flex gap-2 sm:justify-end">
+-            {brands.map((b) => (
++
++        <div className="-mx-4 mt-5 overflow-x-auto px-4 sm:mx-0 sm:px-0">
++          <div role="tablist" aria-label="دسته‌بندی محصولات" className="flex gap-6 border-b border-border/60">
++            {categories.map((c) => (
+               <button
+-                key={b}
++                key={c}
+                 type="button"
+-                onClick={() => setBrand(b)}
+-                aria-pressed={brand === b}
++                role="tab"
++                aria-selected={category === c}
++                onClick={() => setCategory(c)}
+                 className={cn(
+-                  "min-h-9 shrink-0 rounded-full border px-4 text-sm font-semibold transition-colors",
+-                  brand === b
+-                    ? "border-primary bg-primary text-primary-foreground"
+-                    : "border-border bg-muted/40 text-muted-foreground hover:text-foreground",
++                  "relative shrink-0 pb-3 text-sm font-semibold transition-colors",
++                  category === c
++                    ? "text-foreground"
++                    : "text-muted-foreground hover:text-foreground",
+                 )}
+               >
+-                {b}
++                {c === "همه" ? "همه دسته‌ها" : categoryLabel(c)}
++                {category === c && (
++                  <span className="absolute inset-x-0 -bottom-px h-0.5 rounded-full bg-primary" aria-hidden />
++                )}
+               </button>
+             ))}
+           </div>
+         </div>
+-      </div>
+ 
+-      <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+-        {visible.map((group) => (
+-          <ProductCard key={group.key} group={group} onBuy={onBuy} />
+-        ))}
++        {brands.length > 2 && (
++          <div className="-mx-4 mt-4 overflow-x-auto px-4 sm:mx-0 sm:px-0">
++            <div className="flex gap-2">
++              {brands.map((b) => (
++                <button
++                  key={b}
++                  type="button"
++                  onClick={() => setBrand(b)}
++                  aria-pressed={brand === b}
++                  className={cn(
++                    "min-h-8 shrink-0 rounded-full border px-3.5 text-xs font-semibold transition-colors",
++                    brand === b
++                      ? "border-primary bg-primary/10 text-primary"
++                      : "border-border bg-muted/40 text-muted-foreground hover:text-foreground",
++                  )}
++                >
++                  {b}
++                </button>
++              ))}
++            </div>
++          </div>
++        )}
+       </div>
++
++      {visible.length > 0 ? (
++        <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
++          {visible.map((group) => (
++            <ProductCard key={group.key} group={group} onBuy={onBuy} />
++          ))}
++        </div>
++      ) : (
++        <p className="mt-10 text-center text-sm text-muted-foreground">
++          محصولی در این دسته پیدا نشد.
++        </p>
++      )}
+     </section>
+   );
+ }
+diff --git a/apps/web/components/ui/button.tsx b/apps/web/components/ui/button.tsx
+index 9bd857d..6a91cc8 100644
+--- a/apps/web/components/ui/button.tsx
++++ b/apps/web/components/ui/button.tsx
+@@ -2,24 +2,26 @@ import * as React from "react";
+ import { cva, type VariantProps } from "class-variance-authority";
+ import { cn } from "@/lib/utils";
+ 
++// Pill-shaped by default - the Apple.com "Buy" button silhouette - since a
++// full rounded-full CTA reads as more tappable and more confident than a
++// squared-off one, which matters most on the one button in this app that
++// actually takes money.
+ const buttonVariants = cva(
+-  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-xl text-sm font-bold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:pointer-events-none disabled:opacity-50 active:scale-[0.98]",
++  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-full text-sm font-semibold tracking-tight transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:pointer-events-none disabled:opacity-40 active:scale-[0.98]",
+   {
+     variants: {
+       variant: {
+-        primary:
+-          "bg-primary text-primary-foreground shadow-lg shadow-primary/20 hover:brightness-110",
+-        secondary:
+-          "bg-muted text-foreground border border-border hover:bg-muted/70",
+-        ghost: "text-muted-foreground hover:text-foreground hover:bg-muted/50",
++        primary: "bg-primary text-primary-foreground hover:bg-primary/90",
++        secondary: "bg-muted text-foreground hover:bg-muted/70",
++        ghost: "text-muted-foreground hover:text-foreground hover:bg-muted/60",
+         outline:
+-          "border border-border bg-transparent text-foreground hover:bg-muted/40",
++          "border border-border bg-transparent text-foreground hover:bg-muted/50",
+       },
+       size: {
+-        default: "min-h-11 px-5 py-2.5",
+-        sm: "min-h-9 px-3.5 text-xs",
+-        lg: "min-h-12 px-7 text-base",
+-        icon: "size-11",
++        default: "min-h-11 px-6 py-2.5",
++        sm: "min-h-9 px-4 text-[13px]",
++        lg: "min-h-[3.25rem] px-8 text-base",
++        icon: "size-11 rounded-full",
+       },
+     },
+     defaultVariants: {
+diff --git a/apps/web/next-env.d.ts b/apps/web/next-env.d.ts
+index 4f11a03..830fb59 100644
+--- a/apps/web/next-env.d.ts
++++ b/apps/web/next-env.d.ts
+@@ -1,5 +1,6 @@
+ /// <reference types="next" />
+ /// <reference types="next/image-types/global" />
++/// <reference path="./.next/types/routes.d.ts" />
+ 
+ // NOTE: This file should not be edited
+-// see https://nextjs.org/docs/basic-features/typescript for more information.
++// see https://nextjs.org/docs/app/api-reference/config/typescript for more information.
+diff --git a/apps/web/next.config.mjs b/apps/web/next.config.mjs
+index 2b07b80..c854637 100644
+--- a/apps/web/next.config.mjs
++++ b/apps/web/next.config.mjs
+@@ -1,3 +1,27 @@
++const apiOrigin = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
++
++// docs/SECURITY.md calls for a Content-Security-Policy but none was set.
++// This is a same-origin-by-default policy plus the storefront's own API
++// origin for fetch() calls. `'unsafe-inline'` stays on script-src/style-src
++// for now because the App Router's hydration payload and this app's inline
++// `style={{ animationDelay }}` usage (see components/hero.tsx) both need it
++// without a per-request nonce, which would require adding a middleware.ts
++// nonce pipeline - a reasonable follow-up, not something to bolt on
++// half-verified. Even without nonces, this still blocks arbitrary
++// third-party script/style/frame/form injection, which is the gap that
++// mattered here.
++const csp = [
++  "default-src 'self'",
++  `script-src 'self' 'unsafe-inline'${process.env.NODE_ENV === "production" ? "" : " 'unsafe-eval'"}`,
++  "style-src 'self' 'unsafe-inline'",
++  "img-src 'self' data:",
++  "font-src 'self' data:",
++  `connect-src 'self' ${apiOrigin}`,
++  "frame-ancestors 'self'",
++  "base-uri 'self'",
++  "form-action 'self'",
++].join("; ");
++
+ /** @type {import('next').NextConfig} */
+ const nextConfig = {
+   async headers() {
+@@ -12,6 +36,7 @@ const nextConfig = {
+             key: "Permissions-Policy",
+             value: "camera=(), microphone=(), geolocation=()",
+           },
++          { key: "Content-Security-Policy", value: csp },
+         ],
+       },
+     ];
+diff --git a/apps/web/package-lock.json b/apps/web/package-lock.json
+index e875192..a8bee06 100644
+--- a/apps/web/package-lock.json
++++ b/apps/web/package-lock.json
+@@ -11,15 +11,15 @@
+         "class-variance-authority": "^0.7.1",
+         "clsx": "^2.1.1",
+         "lucide-react": "^1.31.0",
+-        "next": "14.2.32",
+-        "react": "18.3.1",
+-        "react-dom": "18.3.1",
++        "next": "15.5.23",
++        "react": "19.2.8",
++        "react-dom": "19.2.8",
+         "tailwind-merge": "^3.6.0"
+       },
+       "devDependencies": {
+         "@types/node": "20.17.30",
+-        "@types/react": "18.3.18",
+-        "@types/react-dom": "18.3.5",
++        "@types/react": "19.2.18",
++        "@types/react-dom": "19.2.4",
+         "autoprefixer": "^10.5.4",
+         "postcss": "^8.5.26",
+         "tailwindcss": "^3.4.19",
+@@ -39,6 +39,482 @@
+         "url": "https://github.com/sponsors/sindresorhus"
+       }
+     },
++    "node_modules/@emnapi/runtime": {
++      "version": "1.11.3",
++      "resolved": "https://registry.npmjs.org/@emnapi/runtime/-/runtime-1.11.3.tgz",
++      "integrity": "sha512-Xz4Tpyki7XyrpbUK1jR1AhdAdaXyhhY4lZ3neLodmhpuWfy2PAQN5B46sAiU4liOXGLkHypn/qU+jvfWSCYYLA==",
++      "license": "MIT",
++      "optional": true,
++      "dependencies": {
++        "tslib": "^2.4.0"
++      }
++    },
++    "node_modules/@img/colour": {
++      "version": "1.1.0",
++      "resolved": "https://registry.npmjs.org/@img/colour/-/colour-1.1.0.tgz",
++      "integrity": "sha512-Td76q7j57o/tLVdgS746cYARfSyxk8iEfRxewL9h4OMzYhbW4TAcppl0mT4eyqXddh6L/jwoM75mo7ixa/pCeQ==",
++      "license": "MIT",
++      "optional": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@img/sharp-darwin-arm64": {
++      "version": "0.34.5",
++      "resolved": "https://registry.npmjs.org/@img/sharp-darwin-arm64/-/sharp-darwin-arm64-0.34.5.tgz",
++      "integrity": "sha512-imtQ3WMJXbMY4fxb/Ndp6HBTNVtWCUI0WdobyheGf5+ad6xX8VIDO8u2xE4qc/fr08CKG/7dDseFtn6M6g/r3w==",
++      "cpu": [
++        "arm64"
++      ],
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "engines": {
++        "node": "^18.17.0 || ^20.3.0 || >=21.0.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      },
++      "optionalDependencies": {
++        "@img/sharp-libvips-darwin-arm64": "1.2.4"
++      }
++    },
++    "node_modules/@img/sharp-darwin-x64": {
++      "version": "0.34.5",
++      "resolved": "https://registry.npmjs.org/@img/sharp-darwin-x64/-/sharp-darwin-x64-0.34.5.tgz",
++      "integrity": "sha512-YNEFAF/4KQ/PeW0N+r+aVVsoIY0/qxxikF2SWdp+NRkmMB7y9LBZAVqQ4yhGCm/H3H270OSykqmQMKLBhBJDEw==",
++      "cpu": [
++        "x64"
++      ],
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "engines": {
++        "node": "^18.17.0 || ^20.3.0 || >=21.0.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      },
++      "optionalDependencies": {
++        "@img/sharp-libvips-darwin-x64": "1.2.4"
++      }
++    },
++    "node_modules/@img/sharp-libvips-darwin-arm64": {
++      "version": "1.2.4",
++      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-darwin-arm64/-/sharp-libvips-darwin-arm64-1.2.4.tgz",
++      "integrity": "sha512-zqjjo7RatFfFoP0MkQ51jfuFZBnVE2pRiaydKJ1G/rHZvnsrHAOcQALIi9sA5co5xenQdTugCvtb1cuf78Vf4g==",
++      "cpu": [
++        "arm64"
++      ],
++      "license": "LGPL-3.0-or-later",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      }
++    },
++    "node_modules/@img/sharp-libvips-darwin-x64": {
++      "version": "1.2.4",
++      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-darwin-x64/-/sharp-libvips-darwin-x64-1.2.4.tgz",
++      "integrity": "sha512-1IOd5xfVhlGwX+zXv2N93k0yMONvUlANylbJw1eTah8K/Jtpi15KC+WSiaX/nBmbm2HxRM1gZ0nSdjSsrZbGKg==",
++      "cpu": [
++        "x64"
++      ],
++      "license": "LGPL-3.0-or-later",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      }
++    },
++    "node_modules/@img/sharp-libvips-linux-arm": {
++      "version": "1.2.4",
++      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-linux-arm/-/sharp-libvips-linux-arm-1.2.4.tgz",
++      "integrity": "sha512-bFI7xcKFELdiNCVov8e44Ia4u2byA+l3XtsAj+Q8tfCwO6BQ8iDojYdvoPMqsKDkuoOo+X6HZA0s0q11ANMQ8A==",
++      "cpu": [
++        "arm"
++      ],
++      "license": "LGPL-3.0-or-later",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      }
++    },
++    "node_modules/@img/sharp-libvips-linux-arm64": {
++      "version": "1.2.4",
++      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-linux-arm64/-/sharp-libvips-linux-arm64-1.2.4.tgz",
++      "integrity": "sha512-excjX8DfsIcJ10x1Kzr4RcWe1edC9PquDRRPx3YVCvQv+U5p7Yin2s32ftzikXojb1PIFc/9Mt28/y+iRklkrw==",
++      "cpu": [
++        "arm64"
++      ],
++      "license": "LGPL-3.0-or-later",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      }
++    },
++    "node_modules/@img/sharp-libvips-linux-ppc64": {
++      "version": "1.2.4",
++      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-linux-ppc64/-/sharp-libvips-linux-ppc64-1.2.4.tgz",
++      "integrity": "sha512-FMuvGijLDYG6lW+b/UvyilUWu5Ayu+3r2d1S8notiGCIyYU/76eig1UfMmkZ7vwgOrzKzlQbFSuQfgm7GYUPpA==",
++      "cpu": [
++        "ppc64"
++      ],
++      "license": "LGPL-3.0-or-later",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      }
++    },
++    "node_modules/@img/sharp-libvips-linux-riscv64": {
++      "version": "1.2.4",
++      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-linux-riscv64/-/sharp-libvips-linux-riscv64-1.2.4.tgz",
++      "integrity": "sha512-oVDbcR4zUC0ce82teubSm+x6ETixtKZBh/qbREIOcI3cULzDyb18Sr/Wcyx7NRQeQzOiHTNbZFF1UwPS2scyGA==",
++      "cpu": [
++        "riscv64"
++      ],
++      "license": "LGPL-3.0-or-later",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      }
++    },
++    "node_modules/@img/sharp-libvips-linux-s390x": {
++      "version": "1.2.4",
++      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-linux-s390x/-/sharp-libvips-linux-s390x-1.2.4.tgz",
++      "integrity": "sha512-qmp9VrzgPgMoGZyPvrQHqk02uyjA0/QrTO26Tqk6l4ZV0MPWIW6LTkqOIov+J1yEu7MbFQaDpwdwJKhbJvuRxQ==",
++      "cpu": [
++        "s390x"
++      ],
++      "license": "LGPL-3.0-or-later",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      }
++    },
++    "node_modules/@img/sharp-libvips-linux-x64": {
++      "version": "1.2.4",
++      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-linux-x64/-/sharp-libvips-linux-x64-1.2.4.tgz",
++      "integrity": "sha512-tJxiiLsmHc9Ax1bz3oaOYBURTXGIRDODBqhveVHonrHJ9/+k89qbLl0bcJns+e4t4rvaNBxaEZsFtSfAdquPrw==",
++      "cpu": [
++        "x64"
++      ],
++      "license": "LGPL-3.0-or-later",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      }
++    },
++    "node_modules/@img/sharp-libvips-linuxmusl-arm64": {
++      "version": "1.2.4",
++      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-linuxmusl-arm64/-/sharp-libvips-linuxmusl-arm64-1.2.4.tgz",
++      "integrity": "sha512-FVQHuwx1IIuNow9QAbYUzJ+En8KcVm9Lk5+uGUQJHaZmMECZmOlix9HnH7n1TRkXMS0pGxIJokIVB9SuqZGGXw==",
++      "cpu": [
++        "arm64"
++      ],
++      "license": "LGPL-3.0-or-later",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      }
++    },
++    "node_modules/@img/sharp-libvips-linuxmusl-x64": {
++      "version": "1.2.4",
++      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-linuxmusl-x64/-/sharp-libvips-linuxmusl-x64-1.2.4.tgz",
++      "integrity": "sha512-+LpyBk7L44ZIXwz/VYfglaX/okxezESc6UxDSoyo2Ks6Jxc4Y7sGjpgU9s4PMgqgjj1gZCylTieNamqA1MF7Dg==",
++      "cpu": [
++        "x64"
++      ],
++      "license": "LGPL-3.0-or-later",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      }
++    },
++    "node_modules/@img/sharp-linux-arm": {
++      "version": "0.34.5",
++      "resolved": "https://registry.npmjs.org/@img/sharp-linux-arm/-/sharp-linux-arm-0.34.5.tgz",
++      "integrity": "sha512-9dLqsvwtg1uuXBGZKsxem9595+ujv0sJ6Vi8wcTANSFpwV/GONat5eCkzQo/1O6zRIkh0m/8+5BjrRr7jDUSZw==",
++      "cpu": [
++        "arm"
++      ],
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": "^18.17.0 || ^20.3.0 || >=21.0.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      },
++      "optionalDependencies": {
++        "@img/sharp-libvips-linux-arm": "1.2.4"
++      }
++    },
++    "node_modules/@img/sharp-linux-arm64": {
++      "version": "0.34.5",
++      "resolved": "https://registry.npmjs.org/@img/sharp-linux-arm64/-/sharp-linux-arm64-0.34.5.tgz",
++      "integrity": "sha512-bKQzaJRY/bkPOXyKx5EVup7qkaojECG6NLYswgktOZjaXecSAeCWiZwwiFf3/Y+O1HrauiE3FVsGxFg8c24rZg==",
++      "cpu": [
++        "arm64"
++      ],
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": "^18.17.0 || ^20.3.0 || >=21.0.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      },
++      "optionalDependencies": {
++        "@img/sharp-libvips-linux-arm64": "1.2.4"
++      }
++    },
++    "node_modules/@img/sharp-linux-ppc64": {
++      "version": "0.34.5",
++      "resolved": "https://registry.npmjs.org/@img/sharp-linux-ppc64/-/sharp-linux-ppc64-0.34.5.tgz",
++      "integrity": "sha512-7zznwNaqW6YtsfrGGDA6BRkISKAAE1Jo0QdpNYXNMHu2+0dTrPflTLNkpc8l7MUP5M16ZJcUvysVWWrMefZquA==",
++      "cpu": [
++        "ppc64"
++      ],
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": "^18.17.0 || ^20.3.0 || >=21.0.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      },
++      "optionalDependencies": {
++        "@img/sharp-libvips-linux-ppc64": "1.2.4"
++      }
++    },
++    "node_modules/@img/sharp-linux-riscv64": {
++      "version": "0.34.5",
++      "resolved": "https://registry.npmjs.org/@img/sharp-linux-riscv64/-/sharp-linux-riscv64-0.34.5.tgz",
++      "integrity": "sha512-51gJuLPTKa7piYPaVs8GmByo7/U7/7TZOq+cnXJIHZKavIRHAP77e3N2HEl3dgiqdD/w0yUfiJnII77PuDDFdw==",
++      "cpu": [
++        "riscv64"
++      ],
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": "^18.17.0 || ^20.3.0 || >=21.0.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      },
++      "optionalDependencies": {
++        "@img/sharp-libvips-linux-riscv64": "1.2.4"
++      }
++    },
++    "node_modules/@img/sharp-linux-s390x": {
++      "version": "0.34.5",
++      "resolved": "https://registry.npmjs.org/@img/sharp-linux-s390x/-/sharp-linux-s390x-0.34.5.tgz",
++      "integrity": "sha512-nQtCk0PdKfho3eC5MrbQoigJ2gd1CgddUMkabUj+rBevs8tZ2cULOx46E7oyX+04WGfABgIwmMC0VqieTiR4jg==",
++      "cpu": [
++        "s390x"
++      ],
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": "^18.17.0 || ^20.3.0 || >=21.0.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      },
++      "optionalDependencies": {
++        "@img/sharp-libvips-linux-s390x": "1.2.4"
++      }
++    },
++    "node_modules/@img/sharp-linux-x64": {
++      "version": "0.34.5",
++      "resolved": "https://registry.npmjs.org/@img/sharp-linux-x64/-/sharp-linux-x64-0.34.5.tgz",
++      "integrity": "sha512-MEzd8HPKxVxVenwAa+JRPwEC7QFjoPWuS5NZnBt6B3pu7EG2Ge0id1oLHZpPJdn3OQK+BQDiw9zStiHBTJQQQQ==",
++      "cpu": [
++        "x64"
++      ],
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": "^18.17.0 || ^20.3.0 || >=21.0.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      },
++      "optionalDependencies": {
++        "@img/sharp-libvips-linux-x64": "1.2.4"
++      }
++    },
++    "node_modules/@img/sharp-linuxmusl-arm64": {
++      "version": "0.34.5",
++      "resolved": "https://registry.npmjs.org/@img/sharp-linuxmusl-arm64/-/sharp-linuxmusl-arm64-0.34.5.tgz",
++      "integrity": "sha512-fprJR6GtRsMt6Kyfq44IsChVZeGN97gTD331weR1ex1c1rypDEABN6Tm2xa1wE6lYb5DdEnk03NZPqA7Id21yg==",
++      "cpu": [
++        "arm64"
++      ],
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": "^18.17.0 || ^20.3.0 || >=21.0.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      },
++      "optionalDependencies": {
++        "@img/sharp-libvips-linuxmusl-arm64": "1.2.4"
++      }
++    },
++    "node_modules/@img/sharp-linuxmusl-x64": {
++      "version": "0.34.5",
++      "resolved": "https://registry.npmjs.org/@img/sharp-linuxmusl-x64/-/sharp-linuxmusl-x64-0.34.5.tgz",
++      "integrity": "sha512-Jg8wNT1MUzIvhBFxViqrEhWDGzqymo3sV7z7ZsaWbZNDLXRJZoRGrjulp60YYtV4wfY8VIKcWidjojlLcWrd8Q==",
++      "cpu": [
++        "x64"
++      ],
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": "^18.17.0 || ^20.3.0 || >=21.0.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      },
++      "optionalDependencies": {
++        "@img/sharp-libvips-linuxmusl-x64": "1.2.4"
++      }
++    },
++    "node_modules/@img/sharp-wasm32": {
++      "version": "0.34.5",
++      "resolved": "https://registry.npmjs.org/@img/sharp-wasm32/-/sharp-wasm32-0.34.5.tgz",
++      "integrity": "sha512-OdWTEiVkY2PHwqkbBI8frFxQQFekHaSSkUIJkwzclWZe64O1X4UlUjqqqLaPbUpMOQk6FBu/HtlGXNblIs0huw==",
++      "cpu": [
++        "wasm32"
++      ],
++      "license": "Apache-2.0 AND LGPL-3.0-or-later AND MIT",
++      "optional": true,
++      "dependencies": {
++        "@emnapi/runtime": "^1.7.0"
++      },
++      "engines": {
++        "node": "^18.17.0 || ^20.3.0 || >=21.0.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      }
++    },
++    "node_modules/@img/sharp-win32-arm64": {
++      "version": "0.34.5",
++      "resolved": "https://registry.npmjs.org/@img/sharp-win32-arm64/-/sharp-win32-arm64-0.34.5.tgz",
++      "integrity": "sha512-WQ3AgWCWYSb2yt+IG8mnC6Jdk9Whs7O0gxphblsLvdhSpSTtmu69ZG1Gkb6NuvxsNACwiPV6cNSZNzt0KPsw7g==",
++      "cpu": [
++        "arm64"
++      ],
++      "license": "Apache-2.0 AND LGPL-3.0-or-later",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "engines": {
++        "node": "^18.17.0 || ^20.3.0 || >=21.0.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      }
++    },
++    "node_modules/@img/sharp-win32-ia32": {
++      "version": "0.34.5",
++      "resolved": "https://registry.npmjs.org/@img/sharp-win32-ia32/-/sharp-win32-ia32-0.34.5.tgz",
++      "integrity": "sha512-FV9m/7NmeCmSHDD5j4+4pNI8Cp3aW+JvLoXcTUo0IqyjSfAZJ8dIUmijx1qaJsIiU+Hosw6xM5KijAWRJCSgNg==",
++      "cpu": [
++        "ia32"
++      ],
++      "license": "Apache-2.0 AND LGPL-3.0-or-later",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "engines": {
++        "node": "^18.17.0 || ^20.3.0 || >=21.0.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      }
++    },
++    "node_modules/@img/sharp-win32-x64": {
++      "version": "0.34.5",
++      "resolved": "https://registry.npmjs.org/@img/sharp-win32-x64/-/sharp-win32-x64-0.34.5.tgz",
++      "integrity": "sha512-+29YMsqY2/9eFEiW93eqWnuLcWcufowXewwSNIT6UwZdUUCrM3oFjMWH/Z6/TMmb4hlFenmfAVbpWeup2jryCw==",
++      "cpu": [
++        "x64"
++      ],
++      "license": "Apache-2.0 AND LGPL-3.0-or-later",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "engines": {
++        "node": "^18.17.0 || ^20.3.0 || >=21.0.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      }
++    },
+     "node_modules/@jridgewell/gen-mapping": {
+       "version": "0.3.13",
+       "resolved": "https://registry.npmjs.org/@jridgewell/gen-mapping/-/gen-mapping-0.3.13.tgz",
+@@ -79,15 +555,15 @@
+       }
+     },
+     "node_modules/@next/env": {
+-      "version": "14.2.32",
+-      "resolved": "https://registry.npmjs.org/@next/env/-/env-14.2.32.tgz",
+-      "integrity": "sha512-n9mQdigI6iZ/DF6pCTwMKeWgF2e8lg7qgt5M7HXMLtyhZYMnf/u905M18sSpPmHL9MKp9JHo56C6jrD2EvWxng==",
++      "version": "15.5.23",
++      "resolved": "https://registry.npmjs.org/@next/env/-/env-15.5.23.tgz",
++      "integrity": "sha512-Mv3Z9hVbFcPnoLevsZ6rnX1TBtyHb5E17yN7HTPDXSXxeNsGBjUFrdbjRXKKXIOhfth7/cg6Ay7PZ2UFawaWsQ==",
+       "license": "MIT"
+     },
+     "node_modules/@next/swc-darwin-arm64": {
+-      "version": "14.2.32",
+-      "resolved": "https://registry.npmjs.org/@next/swc-darwin-arm64/-/swc-darwin-arm64-14.2.32.tgz",
+-      "integrity": "sha512-osHXveM70zC+ilfuFa/2W6a1XQxJTvEhzEycnjUaVE8kpUS09lDpiDDX2YLdyFCzoUbvbo5r0X1Kp4MllIOShw==",
++      "version": "15.5.23",
++      "resolved": "https://registry.npmjs.org/@next/swc-darwin-arm64/-/swc-darwin-arm64-15.5.23.tgz",
++      "integrity": "sha512-SrEwOROH/rhA03F59hHtdhgtfZMWGzr5duDBWgRQt2rS3mJhqMKOcnNx6txOd0/i3E3D3uFKYFvyHsEiwQxzag==",
+       "cpu": [
+         "arm64"
+       ],
+@@ -101,9 +577,9 @@
+       }
+     },
+     "node_modules/@next/swc-darwin-x64": {
+-      "version": "14.2.32",
+-      "resolved": "https://registry.npmjs.org/@next/swc-darwin-x64/-/swc-darwin-x64-14.2.32.tgz",
+-      "integrity": "sha512-P9NpCAJuOiaHHpqtrCNncjqtSBi1f6QUdHK/+dNabBIXB2RUFWL19TY1Hkhu74OvyNQEYEzzMJCMQk5agjw1Qg==",
++      "version": "15.5.23",
++      "resolved": "https://registry.npmjs.org/@next/swc-darwin-x64/-/swc-darwin-x64-15.5.23.tgz",
++      "integrity": "sha512-f0FpFbG2EhDCuptBGcfrLcYMDuQAhe6m1QA4VVfXFrIBoFXvXt/olGbBkYkloKlXQtmhuzvtdYyuu/6zf07GIg==",
+       "cpu": [
+         "x64"
+       ],
+@@ -117,15 +593,12 @@
+       }
+     },
+     "node_modules/@next/swc-linux-arm64-gnu": {
+-      "version": "14.2.32",
+-      "resolved": "https://registry.npmjs.org/@next/swc-linux-arm64-gnu/-/swc-linux-arm64-gnu-14.2.32.tgz",
+-      "integrity": "sha512-v7JaO0oXXt6d+cFjrrKqYnR2ubrD+JYP7nQVRZgeo5uNE5hkCpWnHmXm9vy3g6foMO8SPwL0P3MPw1c+BjbAzA==",
++      "version": "15.5.23",
++      "resolved": "https://registry.npmjs.org/@next/swc-linux-arm64-gnu/-/swc-linux-arm64-gnu-15.5.23.tgz",
++      "integrity": "sha512-WlNtfepUXKX2u2ZsJZ8c3c8+tJSRZqsYzoMwLOY72A8ucKCCgxgNhiePA3qzFYahVWrwcQd8jOeJmBinc+VFVQ==",
+       "cpu": [
+         "arm64"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -136,15 +609,12 @@
+       }
+     },
+     "node_modules/@next/swc-linux-arm64-musl": {
+-      "version": "14.2.32",
+-      "resolved": "https://registry.npmjs.org/@next/swc-linux-arm64-musl/-/swc-linux-arm64-musl-14.2.32.tgz",
+-      "integrity": "sha512-tA6sIKShXtSJBTH88i0DRd6I9n3ZTirmwpwAqH5zdJoQF7/wlJXR8DkPmKwYl5mFWhEKr5IIa3LfpMW9RRwKmQ==",
++      "version": "15.5.23",
++      "resolved": "https://registry.npmjs.org/@next/swc-linux-arm64-musl/-/swc-linux-arm64-musl-15.5.23.tgz",
++      "integrity": "sha512-W/6qKk7UG93mg14PmQC+2urt69MIdwTBLNQ6MJyeC4wOCIHCjz+VfgssvS1pK7mgYBtLC1g6VKNoHD9xB0WWGg==",
+       "cpu": [
+         "arm64"
+       ],
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -155,15 +625,12 @@
+       }
+     },
+     "node_modules/@next/swc-linux-x64-gnu": {
+-      "version": "14.2.32",
+-      "resolved": "https://registry.npmjs.org/@next/swc-linux-x64-gnu/-/swc-linux-x64-gnu-14.2.32.tgz",
+-      "integrity": "sha512-7S1GY4TdnlGVIdeXXKQdDkfDysoIVFMD0lJuVVMeb3eoVjrknQ0JNN7wFlhCvea0hEk0Sd4D1hedVChDKfV2jw==",
++      "version": "15.5.23",
++      "resolved": "https://registry.npmjs.org/@next/swc-linux-x64-gnu/-/swc-linux-x64-gnu-15.5.23.tgz",
++      "integrity": "sha512-vzefI32mi6VMk96RaTAyxApgfGbiFzQBXVsekEjsDv1fr48mlABTWx0sUYhaYCBHWqCalxmz3DxbxFcbFvzNtw==",
+       "cpu": [
+         "x64"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -174,15 +641,12 @@
+       }
+     },
+     "node_modules/@next/swc-linux-x64-musl": {
+-      "version": "14.2.32",
+-      "resolved": "https://registry.npmjs.org/@next/swc-linux-x64-musl/-/swc-linux-x64-musl-14.2.32.tgz",
+-      "integrity": "sha512-OHHC81P4tirVa6Awk6eCQ6RBfWl8HpFsZtfEkMpJ5GjPsJ3nhPe6wKAJUZ/piC8sszUkAgv3fLflgzPStIwfWg==",
++      "version": "15.5.23",
++      "resolved": "https://registry.npmjs.org/@next/swc-linux-x64-musl/-/swc-linux-x64-musl-15.5.23.tgz",
++      "integrity": "sha512-qppK/3dTGOTI+aoWWBZc3DshFIhrzgL8guATlaN9V6M1QJxbkP/rhEZ22tdICsQ/2WWXopMZ2Jokzj2u3uKY3Q==",
+       "cpu": [
+         "x64"
+       ],
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -193,9 +657,9 @@
+       }
+     },
+     "node_modules/@next/swc-win32-arm64-msvc": {
+-      "version": "14.2.32",
+-      "resolved": "https://registry.npmjs.org/@next/swc-win32-arm64-msvc/-/swc-win32-arm64-msvc-14.2.32.tgz",
+-      "integrity": "sha512-rORQjXsAFeX6TLYJrCG5yoIDj+NKq31Rqwn8Wpn/bkPNy5rTHvOXkW8mLFonItS7QC6M+1JIIcLe+vOCTOYpvg==",
++      "version": "15.5.23",
++      "resolved": "https://registry.npmjs.org/@next/swc-win32-arm64-msvc/-/swc-win32-arm64-msvc-15.5.23.tgz",
++      "integrity": "sha512-Wc29KFOdT7XBcII3Vtmw7aoU8Uk3Mes/FNJfhFeSHdYBFJWMcR/DsI8U9BCPUhq/uycsUVuqSKGthW15tLsigA==",
+       "cpu": [
+         "arm64"
+       ],
+@@ -208,26 +672,10 @@
+         "node": ">= 10"
+       }
+     },
+-    "node_modules/@next/swc-win32-ia32-msvc": {
+-      "version": "14.2.32",
+-      "resolved": "https://registry.npmjs.org/@next/swc-win32-ia32-msvc/-/swc-win32-ia32-msvc-14.2.32.tgz",
+-      "integrity": "sha512-jHUeDPVHrgFltqoAqDB6g6OStNnFxnc7Aks3p0KE0FbwAvRg6qWKYF5mSTdCTxA3axoSAUwxYdILzXJfUwlHhA==",
+-      "cpu": [
+-        "ia32"
+-      ],
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "win32"
+-      ],
+-      "engines": {
+-        "node": ">= 10"
+-      }
+-    },
+     "node_modules/@next/swc-win32-x64-msvc": {
+-      "version": "14.2.32",
+-      "resolved": "https://registry.npmjs.org/@next/swc-win32-x64-msvc/-/swc-win32-x64-msvc-14.2.32.tgz",
+-      "integrity": "sha512-2N0lSoU4GjfLSO50wvKpMQgKd4HdI2UHEhQPPPnlgfBJlOgJxkjpkYBqzk08f1gItBB6xF/n+ykso2hgxuydsA==",
++      "version": "15.5.23",
++      "resolved": "https://registry.npmjs.org/@next/swc-win32-x64-msvc/-/swc-win32-x64-msvc-15.5.23.tgz",
++      "integrity": "sha512-/C7wRW4fa9s/PKA18zGPPpVmx8ycgVpP8yOxro4gzGTzjPJdscbAP3ODeFvgiIovxD176Z2J/SXO9t8PJKHLeQ==",
+       "cpu": [
+         "x64"
+       ],
+@@ -278,20 +726,13 @@
+         "node": ">= 8"
+       }
+     },
+-    "node_modules/@swc/counter": {
+-      "version": "0.1.3",
+-      "resolved": "https://registry.npmjs.org/@swc/counter/-/counter-0.1.3.tgz",
+-      "integrity": "sha512-e2BR4lsJkkRlKZ/qCHPw9ZaSxc0MVUd7gtbtaB7aMvHeJVYe8sOB8DBZkP2DtISHGSku9sCK6T6cnY0CtXrOCQ==",
+-      "license": "Apache-2.0"
+-    },
+     "node_modules/@swc/helpers": {
+-      "version": "0.5.5",
+-      "resolved": "https://registry.npmjs.org/@swc/helpers/-/helpers-0.5.5.tgz",
+-      "integrity": "sha512-KGYxvIOXcceOAbEk4bi/dVLEK9z8sZ0uBB3Il5b1rhfClSpcX0yfRO0KmTkqR2cnQDymwLB+25ZyMzICg/cm/A==",
++      "version": "0.5.15",
++      "resolved": "https://registry.npmjs.org/@swc/helpers/-/helpers-0.5.15.tgz",
++      "integrity": "sha512-JQ5TuMi45Owi4/BIMAJBoSQoOJu12oOk/gADqlcUL9JEdHB8vyjUSsxqeNXnmXHjYKMi2WcYtezGEEhqUI/E2g==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@swc/counter": "^0.1.3",
+-        "tslib": "^2.4.0"
++        "tslib": "^2.8.0"
+       }
+     },
+     "node_modules/@types/node": {
+@@ -304,32 +745,24 @@
+         "undici-types": "~6.19.2"
+       }
+     },
+-    "node_modules/@types/prop-types": {
+-      "version": "15.7.15",
+-      "resolved": "https://registry.npmjs.org/@types/prop-types/-/prop-types-15.7.15.tgz",
+-      "integrity": "sha512-F6bEyamV9jKGAFBEmlQnesRPGOQqS2+Uwi0Em15xenOxHaf2hv6L8YCVn3rPdPJOiJfPiCnLIRyvwVaqMY3MIw==",
+-      "dev": true,
+-      "license": "MIT"
+-    },
+     "node_modules/@types/react": {
+-      "version": "18.3.18",
+-      "resolved": "https://registry.npmjs.org/@types/react/-/react-18.3.18.tgz",
+-      "integrity": "sha512-t4yC+vtgnkYjNSKlFx1jkAhH8LgTo2N/7Qvi83kdEaUtMDiwpbLAktKDaAMlRcJ5eSxZkH74eEGt1ky31d7kfQ==",
++      "version": "19.2.18",
++      "resolved": "https://registry.npmjs.org/@types/react/-/react-19.2.18.tgz",
++      "integrity": "sha512-AnzbBERsrLKtk2XSfTbYRLjQPdy116Sty4q+T+Bp3IC4l6jNBvreVPAHmpq9qhXQM7CXZPjLVmGMw9sy+hxQ3w==",
+       "dev": true,
+       "license": "MIT",
+       "dependencies": {
+-        "@types/prop-types": "*",
+-        "csstype": "^3.0.2"
++        "csstype": "^3.2.2"
+       }
+     },
+     "node_modules/@types/react-dom": {
+-      "version": "18.3.5",
+-      "resolved": "https://registry.npmjs.org/@types/react-dom/-/react-dom-18.3.5.tgz",
+-      "integrity": "sha512-P4t6saawp+b/dFrUr2cvkVsfvPguwsxtH6dNIYRllMsefqFzkZk5UIjzyDOv5g1dXIPdG4Sp1yCR4Z6RCUsG/Q==",
++      "version": "19.2.4",
++      "resolved": "https://registry.npmjs.org/@types/react-dom/-/react-dom-19.2.4.tgz",
++      "integrity": "sha512-Bsc+QHgp+P/F02XDzNCY9jnZNCUuLki36KT7VKrTXXLdHf+vHMNZnW1rVu5DNW/rCK+fya3DATySbLM4yhtKUw==",
+       "dev": true,
+       "license": "MIT",
+       "peerDependencies": {
+-        "@types/react": "^18.0.0"
++        "@types/react": "^19.2.0"
+       }
+     },
+     "node_modules/any-promise": {
+@@ -398,9 +831,9 @@
+       }
+     },
+     "node_modules/baseline-browser-mapping": {
+-      "version": "2.11.13",
+-      "resolved": "https://registry.npmjs.org/baseline-browser-mapping/-/baseline-browser-mapping-2.11.13.tgz",
+-      "integrity": "sha512-k9HNuUVMlqVjQ9UHzfPjIqiDbWw7WqT1AoT7GL8VwvF3r0ZfArtgiSPAlmupyNquNgOJHTuH4CKYf8ttMTWBTQ==",
++      "version": "2.11.15",
++      "resolved": "https://registry.npmjs.org/baseline-browser-mapping/-/baseline-browser-mapping-2.11.15.tgz",
++      "integrity": "sha512-FwMjJJ7HnyZpWe+oWxegG0fezZyBZUagI5LZEoO3GCbtbKNwRfMH9Ue5d5v01PNePBy1QSfPSDTTeVL0Hb9EzA==",
+       "dev": true,
+       "license": "Apache-2.0",
+       "bin": {
+@@ -470,17 +903,6 @@
+         "node": "^6 || ^7 || ^8 || ^9 || ^10 || ^11 || ^12 || >=13.7"
+       }
+     },
+-    "node_modules/busboy": {
+-      "version": "1.6.0",
+-      "resolved": "https://registry.npmjs.org/busboy/-/busboy-1.6.0.tgz",
+-      "integrity": "sha512-8SFQbg/0hQ9xy3UNTB0YEnsNBbWfhf7RtnzpL7TkBiTBRfrQ9Fxcnz7VJsleJpyp6rVLvXiuORqjlHi5q+PYuA==",
+-      "dependencies": {
+-        "streamsearch": "^1.1.0"
+-      },
+-      "engines": {
+-        "node": ">=10.16.0"
+-      }
+-    },
+     "node_modules/camelcase-css": {
+       "version": "2.0.1",
+       "resolved": "https://registry.npmjs.org/camelcase-css/-/camelcase-css-2.0.1.tgz",
+@@ -606,6 +1028,16 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/detect-libc": {
++      "version": "2.1.2",
++      "resolved": "https://registry.npmjs.org/detect-libc/-/detect-libc-2.1.2.tgz",
++      "integrity": "sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==",
++      "license": "Apache-2.0",
++      "optional": true,
++      "engines": {
++        "node": ">=8"
++      }
++    },
+     "node_modules/didyoumean": {
+       "version": "1.2.2",
+       "resolved": "https://registry.npmjs.org/didyoumean/-/didyoumean-1.2.2.tgz",
+@@ -621,9 +1053,9 @@
+       "license": "MIT"
+     },
+     "node_modules/electron-to-chromium": {
+-      "version": "1.5.405",
+-      "resolved": "https://registry.npmjs.org/electron-to-chromium/-/electron-to-chromium-1.5.405.tgz",
+-      "integrity": "sha512-bNglH7lPH5l+yHOes7Zr4VqxhOy4BQ9ZBUX4VdoFgxMpzJk7W1ZoO3Vgd9Pxa9PyjQ76sfm2aKH/nzEcCNRlew==",
++      "version": "1.5.411",
++      "resolved": "https://registry.npmjs.org/electron-to-chromium/-/electron-to-chromium-1.5.411.tgz",
++      "integrity": "sha512-gglkxzokjHfawpGxq75XdBV2/l3BAPzrsMs70qgaZdTW5rpV1tC4MdgJVP9fN126bODA4ZJQkn1wryEzJyQXIg==",
+       "dev": true,
+       "license": "ISC"
+     },
+@@ -752,12 +1184,6 @@
+         "node": ">=10.13.0"
+       }
+     },
+-    "node_modules/graceful-fs": {
+-      "version": "4.2.11",
+-      "resolved": "https://registry.npmjs.org/graceful-fs/-/graceful-fs-4.2.11.tgz",
+-      "integrity": "sha512-RbJ5/jmFcNNCcDV5o9eTnBLJ/HszWV0P73bc+Ff4nS/rJj+YaS6IGyiOL0VoBYX+l1Wrl3k63h/KrH+nhJ0XvQ==",
+-      "license": "ISC"
+-    },
+     "node_modules/hasown": {
+       "version": "2.0.4",
+       "resolved": "https://registry.npmjs.org/hasown/-/hasown-2.0.4.tgz",
+@@ -843,12 +1269,6 @@
+         "jiti": "bin/jiti.js"
+       }
+     },
+-    "node_modules/js-tokens": {
+-      "version": "4.0.0",
+-      "resolved": "https://registry.npmjs.org/js-tokens/-/js-tokens-4.0.0.tgz",
+-      "integrity": "sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==",
+-      "license": "MIT"
+-    },
+     "node_modules/lilconfig": {
+       "version": "3.1.3",
+       "resolved": "https://registry.npmjs.org/lilconfig/-/lilconfig-3.1.3.tgz",
+@@ -869,22 +1289,10 @@
+       "dev": true,
+       "license": "MIT"
+     },
+-    "node_modules/loose-envify": {
+-      "version": "1.4.0",
+-      "resolved": "https://registry.npmjs.org/loose-envify/-/loose-envify-1.4.0.tgz",
+-      "integrity": "sha512-lyuxPGr/Wfhrlem2CL/UcnUc1zcqKAImBDzukY7Y5F/yQiNdko6+fRLevlw1HgMySw7f611UIY408EtxRSoK3Q==",
+-      "license": "MIT",
+-      "dependencies": {
+-        "js-tokens": "^3.0.0 || ^4.0.0"
+-      },
+-      "bin": {
+-        "loose-envify": "cli.js"
+-      }
+-    },
+     "node_modules/lucide-react": {
+-      "version": "1.31.0",
+-      "resolved": "https://registry.npmjs.org/lucide-react/-/lucide-react-1.31.0.tgz",
+-      "integrity": "sha512-G8u2eEtoHUnUa9f8lbvqDhCiORMnYLdUEo06EEG9MQvHQrInKcX3Pa2TH39MM5qyzRcWETxB0+aOwAPI1g1kEg==",
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lucide-react/-/lucide-react-1.33.0.tgz",
++      "integrity": "sha512-MTRwMy0ZlL8Ur/vOAiJ9XGHE+kFPC7brq6MxAm0GiGXEBj0qy0jA/pG4N675oSzciO/UCdX8T+5yUQdmDeTLxg==",
+       "license": "ISC",
+       "peerDependencies": {
+         "react": "^16.5.1 || ^17.0.0 || ^18.0.0 || ^19.0.0"
+@@ -945,42 +1353,40 @@
+       }
+     },
+     "node_modules/next": {
+-      "version": "14.2.32",
+-      "resolved": "https://registry.npmjs.org/next/-/next-14.2.32.tgz",
+-      "integrity": "sha512-fg5g0GZ7/nFc09X8wLe6pNSU8cLWbLRG3TZzPJ1BJvi2s9m7eF991se67wliM9kR5yLHRkyGKU49MMx58s3LJg==",
+-      "deprecated": "This version has a security vulnerability. Please upgrade to a patched version. See https://nextjs.org/blog/security-update-2025-12-11 for more details.",
++      "version": "15.5.23",
++      "resolved": "https://registry.npmjs.org/next/-/next-15.5.23.tgz",
++      "integrity": "sha512-Gvd2WKgvxIXCGotxcI1im/Uf3rS3J3oZGw0g/uskg6AVBZhyE3aAbujkYWzS3xLmEPEtTLfkaVQUKK0KMTSIkA==",
+       "license": "MIT",
+       "dependencies": {
+-        "@next/env": "14.2.32",
+-        "@swc/helpers": "0.5.5",
+-        "busboy": "1.6.0",
++        "@next/env": "15.5.23",
++        "@swc/helpers": "0.5.15",
+         "caniuse-lite": "^1.0.30001579",
+-        "graceful-fs": "^4.2.11",
+         "postcss": "8.4.31",
+-        "styled-jsx": "5.1.1"
++        "styled-jsx": "5.1.6"
+       },
+       "bin": {
+         "next": "dist/bin/next"
+       },
+       "engines": {
+-        "node": ">=18.17.0"
++        "node": "^18.18.0 || ^19.8.0 || >= 20.0.0"
+       },
+       "optionalDependencies": {
+-        "@next/swc-darwin-arm64": "14.2.32",
+-        "@next/swc-darwin-x64": "14.2.32",
+-        "@next/swc-linux-arm64-gnu": "14.2.32",
+-        "@next/swc-linux-arm64-musl": "14.2.32",
+-        "@next/swc-linux-x64-gnu": "14.2.32",
+-        "@next/swc-linux-x64-musl": "14.2.32",
+-        "@next/swc-win32-arm64-msvc": "14.2.32",
+-        "@next/swc-win32-ia32-msvc": "14.2.32",
+-        "@next/swc-win32-x64-msvc": "14.2.32"
++        "@next/swc-darwin-arm64": "15.5.23",
++        "@next/swc-darwin-x64": "15.5.23",
++        "@next/swc-linux-arm64-gnu": "15.5.23",
++        "@next/swc-linux-arm64-musl": "15.5.23",
++        "@next/swc-linux-x64-gnu": "15.5.23",
++        "@next/swc-linux-x64-musl": "15.5.23",
++        "@next/swc-win32-arm64-msvc": "15.5.23",
++        "@next/swc-win32-x64-msvc": "15.5.23",
++        "sharp": "^0.34.3"
+       },
+       "peerDependencies": {
+         "@opentelemetry/api": "^1.1.0",
+-        "@playwright/test": "^1.41.2",
+-        "react": "^18.2.0",
+-        "react-dom": "^18.2.0",
++        "@playwright/test": "^1.51.1",
++        "babel-plugin-react-compiler": "*",
++        "react": "^18.2.0 || 19.0.0-rc-de68d2f4-20241204 || ^19.0.0",
++        "react-dom": "^18.2.0 || 19.0.0-rc-de68d2f4-20241204 || ^19.0.0",
+         "sass": "^1.3.0"
+       },
+       "peerDependenciesMeta": {
+@@ -990,37 +1396,12 @@
+         "@playwright/test": {
+           "optional": true
+         },
+-        "sass": {
++        "babel-plugin-react-compiler": {
+           "optional": true
+-        }
+-      }
+-    },
+-    "node_modules/next/node_modules/postcss": {
+-      "version": "8.4.31",
+-      "resolved": "https://registry.npmjs.org/postcss/-/postcss-8.4.31.tgz",
+-      "integrity": "sha512-PS08Iboia9mts/2ygV3eLpY5ghnUcfLV/EXTOW1E2qYxJKGGBUtNjN76FYHnMs36RmARn41bC0AZmn+rR0OVpQ==",
+-      "funding": [
+-        {
+-          "type": "opencollective",
+-          "url": "https://opencollective.com/postcss/"
+-        },
+-        {
+-          "type": "tidelift",
+-          "url": "https://tidelift.com/funding/github/npm/postcss"
+         },
+-        {
+-          "type": "github",
+-          "url": "https://github.com/sponsors/ai"
++        "sass": {
++          "optional": true
+         }
+-      ],
+-      "license": "MIT",
+-      "dependencies": {
+-        "nanoid": "^3.3.6",
+-        "picocolors": "^1.0.0",
+-        "source-map-js": "^1.0.2"
+-      },
+-      "engines": {
+-        "node": "^10 || ^12 || >=14"
+       }
+     },
+     "node_modules/node-releases": {
+@@ -1089,16 +1470,6 @@
+         "url": "https://github.com/sponsors/jonschlinkert"
+       }
+     },
+-    "node_modules/pify": {
+-      "version": "2.3.0",
+-      "resolved": "https://registry.npmjs.org/pify/-/pify-2.3.0.tgz",
+-      "integrity": "sha512-udgsAY+fTnvv7kI7aaxbqwWNb0AHiB0qBO89PZKPkoTmGOgdbrHDKD+0B2X4uTfJ/FT1R09r9gTsjUjNJotuog==",
+-      "dev": true,
+-      "license": "MIT",
+-      "engines": {
+-        "node": ">=0.10.0"
+-      }
+-    },
+     "node_modules/pirates": {
+       "version": "4.0.7",
+       "resolved": "https://registry.npmjs.org/pirates/-/pirates-4.0.7.tgz",
+@@ -1113,7 +1484,6 @@
+       "version": "8.5.26",
+       "resolved": "https://registry.npmjs.org/postcss/-/postcss-8.5.26.tgz",
+       "integrity": "sha512-u82N74LFzG8ca+dD8puPnplTXoGH4fTPpVGuIbt36G3qvNlkvfD0lEAZSxaly3KX8TS/L1A1gsCEmvKmBcVbkQ==",
+-      "dev": true,
+       "funding": [
+         {
+           "type": "opencollective",
+@@ -1294,39 +1664,32 @@
+       "license": "MIT"
+     },
+     "node_modules/react": {
+-      "version": "18.3.1",
+-      "resolved": "https://registry.npmjs.org/react/-/react-18.3.1.tgz",
+-      "integrity": "sha512-wS+hAgJShR0KhEvPJArfuPVN1+Hz1t0Y6n5jLrGQbkb4urgPE/0Rve+1kMB1v/oWgHgm4WIcV+i7F2pTVj+2iQ==",
++      "version": "19.2.8",
++      "resolved": "https://registry.npmjs.org/react/-/react-19.2.8.tgz",
++      "integrity": "sha512-PWaYA1L/q9u2u7xYQi+Y3L3Yfnie7XyLeaJICV1MGD6LprsBxcAqGjYyr0eY3p+QdsA+x/Irkt4Qif8D63+Sbw==",
+       "license": "MIT",
+-      "dependencies": {
+-        "loose-envify": "^1.1.0"
+-      },
+       "engines": {
+         "node": ">=0.10.0"
+       }
+     },
+     "node_modules/react-dom": {
+-      "version": "18.3.1",
+-      "resolved": "https://registry.npmjs.org/react-dom/-/react-dom-18.3.1.tgz",
+-      "integrity": "sha512-5m4nQKp+rZRb09LNH59GM4BxTh9251/ylbKIbpe7TpGxfJ+9kv6BLkLBXIjjspbgbnIBNqlI23tRnTWT0snUIw==",
++      "version": "19.2.8",
++      "resolved": "https://registry.npmjs.org/react-dom/-/react-dom-19.2.8.tgz",
++      "integrity": "sha512-rVprimfGBG3DR+Tq0IQG2DT5PxKth1WIGDmj5yPmlzr4YBe7uyE+Du4oVqTDXZSHGGGXRtTJEGSSePyQCMBglQ==",
+       "license": "MIT",
+       "dependencies": {
+-        "loose-envify": "^1.1.0",
+-        "scheduler": "^0.23.2"
++        "scheduler": "^0.27.0"
+       },
+       "peerDependencies": {
+-        "react": "^18.3.1"
++        "react": "^19.2.8"
+       }
+     },
+     "node_modules/read-cache": {
+-      "version": "1.0.0",
+-      "resolved": "https://registry.npmjs.org/read-cache/-/read-cache-1.0.0.tgz",
+-      "integrity": "sha512-Owdv/Ft7IjOgm/i0xvNDZ1LrRANRfew4b2prF3OWMQLxLfu3bS8FVhCsrSCMK4lR56Y9ya+AThoTpDCTxCmpRA==",
++      "version": "1.0.2",
++      "resolved": "https://registry.npmjs.org/read-cache/-/read-cache-1.0.2.tgz",
++      "integrity": "sha512-/peqiBB/n07gQGLsWaHho3WfvUyRscw0gYTsEFMhrIe/nWLkYaf5SbKYjGYqtRV3aPwykJgF2VEMo1ac4bnsGA==",
+       "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "pify": "^2.3.0"
+-      }
++      "license": "MIT"
+     },
+     "node_modules/readdirp": {
+       "version": "3.6.0",
+@@ -1399,12 +1762,67 @@
+       }
+     },
+     "node_modules/scheduler": {
+-      "version": "0.23.2",
+-      "resolved": "https://registry.npmjs.org/scheduler/-/scheduler-0.23.2.tgz",
+-      "integrity": "sha512-UOShsPwz7NrMUqhR6t0hWjFduvOzbtv7toDH1/hIrfRNIDBnnBWd0CwJTGvTpngVlmwGCdP9/Zl/tVrDqcuYzQ==",
+-      "license": "MIT",
++      "version": "0.27.0",
++      "resolved": "https://registry.npmjs.org/scheduler/-/scheduler-0.27.0.tgz",
++      "integrity": "sha512-eNv+WrVbKu1f3vbYJT/xtiF5syA5HPIMtf9IgY/nKg0sWqzAUEvqY/xm7OcZc/qafLx/iO9FgOmeSAp4v5ti/Q==",
++      "license": "MIT"
++    },
++    "node_modules/semver": {
++      "version": "7.8.5",
++      "resolved": "https://registry.npmjs.org/semver/-/semver-7.8.5.tgz",
++      "integrity": "sha512-Y7/KDsb8LjooZpwaqGyulO6DQlksgCncchHGk+sZIY4SBvUocMBEFH5Ur1fI4dV+Jvl0w6cjvucaIi40puRioA==",
++      "license": "ISC",
++      "optional": true,
++      "bin": {
++        "semver": "bin/semver.js"
++      },
++      "engines": {
++        "node": ">=10"
++      }
++    },
++    "node_modules/sharp": {
++      "version": "0.34.5",
++      "resolved": "https://registry.npmjs.org/sharp/-/sharp-0.34.5.tgz",
++      "integrity": "sha512-Ou9I5Ft9WNcCbXrU9cMgPBcCK8LiwLqcbywW3t4oDV37n1pzpuNLsYiAV8eODnjbtQlSDwZ2cUEeQz4E54Hltg==",
++      "hasInstallScript": true,
++      "license": "Apache-2.0",
++      "optional": true,
+       "dependencies": {
+-        "loose-envify": "^1.1.0"
++        "@img/colour": "^1.0.0",
++        "detect-libc": "^2.1.2",
++        "semver": "^7.7.3"
++      },
++      "engines": {
++        "node": "^18.17.0 || ^20.3.0 || >=21.0.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      },
++      "optionalDependencies": {
++        "@img/sharp-darwin-arm64": "0.34.5",
++        "@img/sharp-darwin-x64": "0.34.5",
++        "@img/sharp-libvips-darwin-arm64": "1.2.4",
++        "@img/sharp-libvips-darwin-x64": "1.2.4",
++        "@img/sharp-libvips-linux-arm": "1.2.4",
++        "@img/sharp-libvips-linux-arm64": "1.2.4",
++        "@img/sharp-libvips-linux-ppc64": "1.2.4",
++        "@img/sharp-libvips-linux-riscv64": "1.2.4",
++        "@img/sharp-libvips-linux-s390x": "1.2.4",
++        "@img/sharp-libvips-linux-x64": "1.2.4",
++        "@img/sharp-libvips-linuxmusl-arm64": "1.2.4",
++        "@img/sharp-libvips-linuxmusl-x64": "1.2.4",
++        "@img/sharp-linux-arm": "0.34.5",
++        "@img/sharp-linux-arm64": "0.34.5",
++        "@img/sharp-linux-ppc64": "0.34.5",
++        "@img/sharp-linux-riscv64": "0.34.5",
++        "@img/sharp-linux-s390x": "0.34.5",
++        "@img/sharp-linux-x64": "0.34.5",
++        "@img/sharp-linuxmusl-arm64": "0.34.5",
++        "@img/sharp-linuxmusl-x64": "0.34.5",
++        "@img/sharp-wasm32": "0.34.5",
++        "@img/sharp-win32-arm64": "0.34.5",
++        "@img/sharp-win32-ia32": "0.34.5",
++        "@img/sharp-win32-x64": "0.34.5"
+       }
+     },
+     "node_modules/source-map-js": {
+@@ -1416,18 +1834,10 @@
+         "node": ">=0.10.0"
+       }
+     },
+-    "node_modules/streamsearch": {
+-      "version": "1.1.0",
+-      "resolved": "https://registry.npmjs.org/streamsearch/-/streamsearch-1.1.0.tgz",
+-      "integrity": "sha512-Mcc5wHehp9aXz1ax6bZUyY5afg9u2rv5cqQI3mRrYkGC8rW2hM02jWuwjtL++LS5qinSyhj2QfLyNsuc+VsExg==",
+-      "engines": {
+-        "node": ">=10.0.0"
+-      }
+-    },
+     "node_modules/styled-jsx": {
+-      "version": "5.1.1",
+-      "resolved": "https://registry.npmjs.org/styled-jsx/-/styled-jsx-5.1.1.tgz",
+-      "integrity": "sha512-pW7uC1l4mBZ8ugbiZrcIsiIvVx1UmTfw7UkC3Um2tmfUq9Bhk8IiyEIPl6F8agHgjzku6j0xQEZbfA5uSgSaCw==",
++      "version": "5.1.6",
++      "resolved": "https://registry.npmjs.org/styled-jsx/-/styled-jsx-5.1.6.tgz",
++      "integrity": "sha512-qSVyDTeMotdvQYoHWLNGwRFJHC+i+ZvdBRYosOFgC+Wg1vx4frN2/RG/NA7SYqqvKNLf39P2LSRA2pu6n0XYZA==",
+       "license": "MIT",
+       "dependencies": {
+         "client-only": "0.0.1"
+@@ -1436,7 +1846,7 @@
+         "node": ">= 12.0.0"
+       },
+       "peerDependencies": {
+-        "react": ">= 16.8.0 || 17.x.x || ^18.0.0-0"
++        "react": ">= 16.8.0 || 17.x.x || ^18.0.0-0 || ^19.0.0-0"
+       },
+       "peerDependenciesMeta": {
+         "@babel/core": {
+diff --git a/apps/web/package.json b/apps/web/package.json
+index 9b719b8..8768da9 100644
+--- a/apps/web/package.json
++++ b/apps/web/package.json
+@@ -12,18 +12,21 @@
+     "class-variance-authority": "^0.7.1",
+     "clsx": "^2.1.1",
+     "lucide-react": "^1.31.0",
+-    "next": "14.2.32",
+-    "react": "18.3.1",
+-    "react-dom": "18.3.1",
++    "next": "15.5.23",
++    "react": "19.2.8",
++    "react-dom": "19.2.8",
+     "tailwind-merge": "^3.6.0"
+   },
+   "devDependencies": {
+     "@types/node": "20.17.30",
+-    "@types/react": "18.3.18",
+-    "@types/react-dom": "18.3.5",
++    "@types/react": "19.2.18",
++    "@types/react-dom": "19.2.4",
+     "autoprefixer": "^10.5.4",
+     "postcss": "^8.5.26",
+     "tailwindcss": "^3.4.19",
+     "typescript": "5.8.2"
++  },
++  "overrides": {
++    "postcss": "^8.5.26"
+   }
+ }
+-- 
+2.43.0
+
