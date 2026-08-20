@@ -21,7 +21,9 @@
 - ✅ Redis-backed Rate Limiting
 - ✅ Category discovery و Product filtering
 - ✅ Integration Test برای مسیرهای واقعی API
-- ✅ تنظیمات Vercel برای Frontend
+- ✅ Production-safe Vercel configuration
+- ✅ Fail-fast روی نبودن API URL در Production
+- ✅ Demo Mode فقط به‌صورت Explicit و Opt-in
 
 ---
 
@@ -69,50 +71,16 @@ apps/
 .github/workflows/
 ├── api-ci.yml
 └── web-ci.yml
+
+artifacts/
+└── review-redesign/
+    ├── rishehpayfixreviewredesign.patch
+    └── rishehpayfixreviewredesign.bundle
 ```
-
----
-
-## 🧩 Review / Redesign Handoff Artifacts
-
-برای بازبینی فنی و انتقال تغییرات مرحله Fix + Review + Redesign دو artifact همراه پروژه در نظر گرفته شده‌اند:
-
-```text
-risheh-pay-fix-review-redesign.patch
-risheh-pay-fix-review-redesign.bundle
-```
-
-این بسته تغییرات روی commit مبنای زیر ساخته شده است:
-
-```text
-9ee1144215b1db4b7f6876f9626e9168f25b86d5
-```
-
-و شامل اصلاحات Checkout/Migration، Security/RBAC، Rate Limiting، Integration Tests و بازطراحی Storefront است.
-
-### اعمال Patch
-
-```bash
-git checkout main
-git pull
-git am risheh-pay-fix-review-redesign.patch
-```
-
-### استفاده از Bundle
-
-```bash
-git bundle verify risheh-pay-fix-review-redesign.bundle
-git fetch risheh-pay-fix-review-redesign.bundle fix/review-redesign-storefront:fix/review-redesign-storefront
-git checkout fix/review-redesign-storefront
-```
-
-> قبل از اعمال artifactها مطمئن شوید HEAD پروژه با commit مبنا سازگار است یا تغییرات را ابتدا روی یک branch جداگانه بررسی کنید.
 
 ---
 
 ## 🔐 Security & Reliability
-
-نسخه Review/Redesign این موارد را پوشش می‌دهد:
 
 - جلوگیری از double-purchase و double-refund با State Machine، locking و idempotency
 - Encryption داده تحویلی در حالت at-rest با Fernet
@@ -122,17 +90,8 @@ git checkout fix/review-redesign-storefront
 - Content Security Policy برای Web
 - Redis Rate Limiting با fail-open behavior
 - Integration tests برای endpointهای واقعی
-
-متغیرهای مهم محیطی:
-
-```env
-DELIVERY_ENCRYPTION_KEY=
-ADMIN_API_KEY=
-DATABASE_URL=
-REDIS_URL=
-PAYMENT_SECRET=
-PAYMENT_CALLBACK_URL=
-```
+- Production build بدون `NEXT_PUBLIC_API_URL` fail می‌شود
+- قطع Backend در Production دیگر به Fake/Demo Order تبدیل نمی‌شود
 
 هیچ Secret واقعی نباید داخل Git یا README ذخیره شود.
 
@@ -156,7 +115,7 @@ docker compose up --build
 
 ```bash
 cd apps/web
-npm install
+npm ci
 npm run dev
 ```
 
@@ -170,15 +129,51 @@ pytest
 
 ---
 
-## 🚀 Vercel
+## 🚀 Vercel Production Deployment
 
-برای Deploy فرانت‌اند در Vercel:
+Canonical setup پیشنهادی:
 
 ```text
 Root Directory = apps/web
+Framework = Next.js
+Install Command = npm ci
+Build Command = npm run build
 ```
 
-Backend و سرویس‌های stateful مانند PostgreSQL/Redis باید جداگانه Deploy شوند.
+برای سازگاری با پروژه‌هایی که Root Directory هنوز روی repository root تنظیم شده، فایل `/vercel.json` نیز build را به `apps/web` هدایت می‌کند.
+
+### Environment Variables ضروری Web
+
+```env
+NEXT_PUBLIC_API_URL=https://api.example.com
+NEXT_PUBLIC_ENABLE_DEMO_MODE=false
+```
+
+قوانین:
+
+- `NEXT_PUBLIC_API_URL` در production اجباری است.
+- `NEXT_PUBLIC_ENABLE_DEMO_MODE=false` برای هر محیطی که پرداخت واقعی دارد الزامی است.
+- Demo Mode فقط برای Preview/Demo مستقل و با مقدار `true` قابل فعال‌سازی است.
+- Backend، PostgreSQL و Redis روی Vercel Frontend deploy نمی‌شوند و باید سرویس مستقل داشته باشند.
+
+---
+
+## ⚙️ Backend Production Environment
+
+حداقل تنظیمات لازم:
+
+```env
+APP_ENV=production
+APP_SECRET_KEY=<strong-secret>
+DATABASE_URL=<production-postgres-url>
+REDIS_URL=<production-redis-url>
+CORS_ORIGINS=["https://your-frontend-domain"]
+DELIVERY_ENCRYPTION_KEY=<strong-secret>
+ADMIN_API_KEY=<strong-secret>
+PAYMENT_CALLBACK_URL=https://api.example.com/api/v1/payments/callback
+```
+
+در صورت استفاده از Provider و Payment واقعی، credentialهای مربوط نیز فقط از Secret Manager / Environment دریافت شوند.
 
 ---
 
@@ -193,22 +188,38 @@ Backend و سرویس‌های stateful مانند PostgreSQL/Redis باید ج�
 | Migrations | Alembic |
 | Delivery Security | Fernet / Cryptography |
 | Infrastructure | Docker Compose |
+| Frontend Hosting | Vercel |
 | CI | GitHub Actions |
 
 ---
 
 ## ✅ Production Checklist
 
-- [ ] Secretها در Environment/Secret Manager تنظیم شوند
-- [ ] `DELIVERY_ENCRYPTION_KEY` تولید و امن نگهداری شود
-- [ ] `ADMIN_API_KEY` روی Production تنظیم شود
-- [ ] CORS فقط برای Originهای واقعی Production تنظیم شود
-- [ ] PostgreSQL migration روی دیتابیس تمیز تست شود
-- [ ] Redis availability بررسی شود
-- [ ] API Integration Tests پاس شوند
-- [ ] Web build و smoke test پاس شوند
-- [ ] Payment callback روی دامنه واقعی تست شود
-- [ ] Backup، monitoring و alerting فعال شوند
+- [ ] `NEXT_PUBLIC_API_URL` روی Vercel Production تنظیم شده
+- [ ] `NEXT_PUBLIC_ENABLE_DEMO_MODE=false` روی Production تنظیم شده
+- [ ] Secretها در Environment/Secret Manager تنظیم شده‌اند
+- [ ] `DELIVERY_ENCRYPTION_KEY` تولید و امن نگهداری شده
+- [ ] `ADMIN_API_KEY` روی Production تنظیم شده
+- [ ] CORS فقط Origin واقعی Frontend را مجاز می‌کند
+- [ ] PostgreSQL migration روی دیتابیس تمیز تست شده
+- [ ] Redis availability بررسی شده
+- [ ] API Integration Tests پاس شده‌اند
+- [ ] Web build و smoke test پاس شده‌اند
+- [ ] Payment callback روی دامنه واقعی تست شده
+- [ ] Backup، monitoring و alerting فعال شده‌اند
+- [ ] Runtime backend outage باعث Demo Checkout نمی‌شود
+
+---
+
+## 🧩 Review / Redesign Handoff Artifacts
+
+نسخه‌های Patch و Bundle مربوط به مرحله Fix + Review + Redesign داخل این مسیر نگهداری می‌شوند:
+
+```text
+artifacts/review-redesign/
+```
+
+این artifactها برای recovery، audit و handoff هستند و تغییرات اصلی آن‌ها قبلاً روی `main` اعمال شده است؛ برای اجرای عادی پروژه نیازی به apply مجدد آن‌ها نیست.
 
 ---
 
