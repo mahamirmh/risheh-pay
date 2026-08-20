@@ -29,17 +29,40 @@ export interface Order {
   delivery?: string | null;
 }
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const BASE = `${API}/api/v1`;
+const API = process.env.NEXT_PUBLIC_API_URL?.trim();
+const DEMO_ENABLED = process.env.NEXT_PUBLIC_ENABLE_DEMO_MODE === "true";
+const BASE = API ? `${API.replace(/\/$/, "")}/api/v1` : "";
 
-/** Whether the live backend responded at least once. Falls back to demo mode. */
-let liveMode: boolean | null = null;
+if (process.env.NODE_ENV === "production" && !API && !DEMO_ENABLED) {
+  throw new Error(
+    "NEXT_PUBLIC_API_URL is required in production unless NEXT_PUBLIC_ENABLE_DEMO_MODE=true",
+  );
+}
+
+/** Tracks whether the live backend has responded. Demo fallback is opt-in only. */
+let liveMode: boolean | null = API ? null : false;
 
 export function isDemoMode(): boolean {
-  return liveMode === false;
+  return DEMO_ENABLED && liveMode === false;
+}
+
+function backendUnavailable(operation: string, cause?: unknown): Error {
+  const message = `سرویس پرداخت موقتاً در دسترس نیست (${operation}). لطفاً دوباره تلاش کنید.`;
+  return cause instanceof Error ? new Error(message, { cause }) : new Error(message);
+}
+
+function allowDemoFallback(operation: string, cause?: unknown): void {
+  if (!DEMO_ENABLED) {
+    throw backendUnavailable(operation, cause);
+  }
+  liveMode = false;
 }
 
 async function tryFetch(input: string, init?: RequestInit): Promise<Response> {
+  if (!API) {
+    throw backendUnavailable("API configuration");
+  }
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 4000);
   try {
@@ -52,8 +75,8 @@ async function tryFetch(input: string, init?: RequestInit): Promise<Response> {
 }
 
 /* ---------------------------------------------------------------------------
- * Demo data + in-memory order engine (used only when the backend is offline).
- * Mirrors the FastAPI contract so the full flow is previewable end-to-end.
+ * Demo data + in-memory order engine.
+ * This path is available only when NEXT_PUBLIC_ENABLE_DEMO_MODE=true.
  * ------------------------------------------------------------------------- */
 
 const DEMO_PRODUCTS: Product[] = [
@@ -90,7 +113,6 @@ function demo(
   };
 }
 
-/** Approximate the backend pricing: fx 100000, +1% risk, +5% margin. */
 function demoPrice(denomination: string): string {
   const cost = Number(denomination) * 100000;
   return (cost * 1.06).toFixed(0);
@@ -108,7 +130,6 @@ function uid(prefix: string) {
   return `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-/** Advance a demo order through PAID → PROCESSING → DELIVERED based on elapsed time. */
 function progressDemoOrder(rec: DemoOrderRecord): Order {
   if (rec.paidAt == null) return rec.order;
   const elapsed = Date.now() - rec.paidAt;
@@ -124,17 +145,13 @@ function progressDemoOrder(rec: DemoOrderRecord): Order {
   return { ...rec.order };
 }
 
-/* ---------------------------------------------------------------------------
- * Public API
- * ------------------------------------------------------------------------- */
-
 export async function getProducts(): Promise<Product[]> {
   try {
     const res = await tryFetch(`${BASE}/products`);
-    if (!res.ok) throw new Error("bad status");
+    if (!res.ok) throw new Error(`products returned ${res.status}`);
     return (await res.json()) as Product[];
-  } catch {
-    liveMode = false;
+  } catch (error) {
+    allowDemoFallback("products", error);
     return DEMO_PRODUCTS;
   }
 }
@@ -147,12 +164,15 @@ export async function createQuote(variantId: string): Promise<Quote> {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ variant_id: variantId }),
       });
-      if (!res.ok) throw new Error("quote failed");
+      if (!res.ok) throw new Error(`quote returned ${res.status}`);
       return (await res.json()) as Quote;
-    } catch {
-      liveMode = false;
+    } catch (error) {
+      allowDemoFallback("quote", error);
     }
+  } else if (!DEMO_ENABLED) {
+    throw backendUnavailable("quote");
   }
+
   const product = DEMO_PRODUCTS.find((p) => p.id === variantId) ?? DEMO_PRODUCTS[0];
   const quote: Quote = {
     id: uid("q"),
@@ -172,12 +192,15 @@ export async function createOrder(quoteId: string): Promise<Order> {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ quote_id: quoteId }),
       });
-      if (!res.ok) throw new Error("order failed");
+      if (!res.ok) throw new Error(`order returned ${res.status}`);
       return (await res.json()) as Order;
-    } catch {
-      liveMode = false;
+    } catch (error) {
+      allowDemoFallback("order", error);
     }
+  } else if (!DEMO_ENABLED) {
+    throw backendUnavailable("order");
   }
+
   const quote = demoQuotes.get(quoteId);
   const order: Order = {
     id: uid("o"),
@@ -195,12 +218,15 @@ export async function payOrder(orderId: string): Promise<Order> {
   if (liveMode !== false && !demoOrders.has(orderId)) {
     try {
       const res = await tryFetch(`${BASE}/orders/${orderId}/pay`, { method: "POST" });
-      if (!res.ok) throw new Error("pay failed");
+      if (!res.ok) throw new Error(`pay returned ${res.status}`);
       return (await res.json()) as Order;
-    } catch {
-      liveMode = false;
+    } catch (error) {
+      allowDemoFallback("payment", error);
     }
+  } else if (!DEMO_ENABLED && !demoOrders.has(orderId)) {
+    throw backendUnavailable("payment");
   }
+
   const rec = demoOrders.get(orderId);
   if (!rec) throw new Error("سفارش یافت نشد");
   rec.paidAt = Date.now();
@@ -212,12 +238,15 @@ export async function getOrder(orderId: string): Promise<Order> {
   if (liveMode !== false && !demoOrders.has(orderId)) {
     try {
       const res = await tryFetch(`${BASE}/orders/${orderId}`);
-      if (!res.ok) throw new Error("get order failed");
+      if (!res.ok) throw new Error(`get order returned ${res.status}`);
       return (await res.json()) as Order;
-    } catch {
-      liveMode = false;
+    } catch (error) {
+      allowDemoFallback("order status", error);
     }
+  } else if (!DEMO_ENABLED && !demoOrders.has(orderId)) {
+    throw backendUnavailable("order status");
   }
+
   const rec = demoOrders.get(orderId);
   if (!rec) throw new Error("سفارش یافت نشد");
   return progressDemoOrder(rec);
