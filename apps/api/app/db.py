@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:3000"]
     # Demo catalog creation is opt-in. It MUST remain false in production.
     seed_demo_catalog: bool = False
+    # Integration adapters. The current repository implements only "mock";
+    # unsupported names fail fast rather than silently using a fake adapter.
+    payment_provider: str = "mock"
+    digital_goods_provider: str = "mock"
     # Server-held key gating the admin router (app/admin.py). Unset by default
     # so admin endpoints are refused (503) rather than silently open.
     admin_api_key: str | None = None
