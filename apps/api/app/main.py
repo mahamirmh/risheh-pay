@@ -27,8 +27,11 @@ app.include_router(admin_router)
 
 @app.on_event("startup")
 async def startup() -> None:
-    async with SessionLocal() as session:
-        await seed_demo_catalog(session)
+    if settings.seed_demo_catalog:
+        if settings.app_env.lower() == "production":
+            raise RuntimeError("SEED_DEMO_CATALOG must be false in production")
+        async with SessionLocal() as session:
+            await seed_demo_catalog(session)
 
 
 @app.get("/health", tags=["operations"])
