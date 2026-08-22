@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+!.env.production.example
 *.pem
 *.key
 
@@ -33,6 +34,7 @@ Thumbs.db
 *.log
 .tmp/
 tmp/
+backups/
 
 # local data
 *.sqlite3
