@@ -27,9 +27,16 @@ app.include_router(admin_router)
 
 @app.on_event("startup")
 async def startup() -> None:
+    # Safety gate: this repository revision still wires MockPaymentProvider and
+    # MockDigitalGoodsProvider in app/api.py. Never let APP_ENV=production make
+    # that look like a real-money deployment. Remove/replace this guard only in
+    # the same change that wires and tests real adapters end-to-end.
+    if settings.app_env.lower() == "production":
+        raise RuntimeError(
+            "Financial production is blocked: this revision implements mock-only payment and digital-goods adapters"
+        )
+
     if settings.seed_demo_catalog:
-        if settings.app_env.lower() == "production":
-            raise RuntimeError("SEED_DEMO_CATALOG must be false in production")
         async with SessionLocal() as session:
             await seed_demo_catalog(session)
 
