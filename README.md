@@ -2,7 +2,7 @@
 
 > زیرساخت فروش، پرداخت و تحویل آنی محصولات دیجیتال با معماری Transaction-Safe
 
-**Risheh Pay** یک پلتفرم Full-Stack برای فروش محصولات دیجیتال بین‌المللی است؛ از انتخاب محصول و محاسبه قیمت ریالی تا پرداخت، خرید از Provider، تحویل خودکار و مدیریت خطا/Refund.
+**Risheh Pay** یک پلتفرم Full-Stack برای فروش محصولات دیجیتال است؛ از انتخاب محصول و محاسبه قیمت تا پرداخت، خرید از Provider، تحویل خودکار و مدیریت خطا، Retry و Refund.
 
 ---
 
@@ -11,19 +11,26 @@
 - ✅ Storefront با Next.js + TypeScript
 - ✅ Backend با FastAPI
 - ✅ PostgreSQL + Redis
-- ✅ Docker Compose برای اجرای Full Stack
-- ✅ Health / Readiness checks
+- ✅ Docker Compose برای Development Backend
+- ✅ Docker Compose مستقل و Hardened برای VPS Production
+- ✅ Docker image مستقل Next.js با Standalone Output
+- ✅ Nginx Reverse Proxy داخلی
+- ✅ Health / Readiness checks برای API، Web، DB، Redis و Proxy
+- ✅ PostgreSQL Migration با Alembic
 - ✅ GitHub Actions برای API و Web
 - ✅ ساختار Transaction-Safe برای Checkout و Fulfillment
-- ✅ Order State Machine + کنترل Retry/Idempotency
+- ✅ Order State Machine + Retry / Idempotency
 - ✅ Delivery Encryption با `DELIVERY_ENCRYPTION_KEY`
 - ✅ Admin API محافظت‌شده با `ADMIN_API_KEY`
 - ✅ Redis-backed Rate Limiting
-- ✅ Category discovery و Product filtering
-- ✅ Integration Test برای مسیرهای واقعی API
-- ✅ Production-safe Vercel configuration
+- ✅ Redis Password در Production
+- ✅ Explicit CORS allow-list
 - ✅ Fail-fast روی نبودن API URL در Production
 - ✅ Demo Mode فقط به‌صورت Explicit و Opt-in
+- ✅ Demo Catalog در Production غیرفعال و Fail-fast
+- ✅ Guarded Production Deploy Script
+- ✅ PostgreSQL Backup + Retention Script
+- ✅ راهنمای کامل VPS + TLS + Backup + Rollback
 
 ---
 
@@ -57,25 +64,64 @@ Reveal + Audit Log
 
 > **Payment Success ≠ Order Delivered**
 
-پرداخت و تحویل دو مرحله مستقل هستند. بنابراین سیستم باید Retry، Provider Failure، Duplicate Request، Refund و Recovery را بدون ایجاد خرید یا بازپرداخت تکراری مدیریت کند.
+پرداخت و تحویل دو مرحله مستقل هستند. سیستم باید Provider Failure، Duplicate Callback، Retry، Refund و Recovery را بدون خرید یا بازپرداخت تکراری مدیریت کند.
 
 ---
 
-## 🏗️ Repository Structure
+## 🏗️ Production Architecture
+
+```text
+Internet
+   ↓
+DNS / Cloudflare
+   ↓
+Host Nginx :443 + Let's Encrypt
+   ↓
+127.0.0.1:8080
+   ↓
+Docker Nginx
+   ├── /api/* → FastAPI :8000
+   └── /*      → Next.js :3000
+                    │
+FastAPI ────────────┼── PostgreSQL (private)
+                    └── Redis (private + password)
+```
+
+PostgreSQL، Redis، FastAPI و Next.js در Production مستقیماً روی اینترنت expose نمی‌شوند.
+
+---
+
+## 🗂️ Repository Structure
 
 ```text
 apps/
-├── api/       # FastAPI + PostgreSQL + Redis + payment/fulfillment adapters
-└── web/       # Next.js storefront
+├── api/
+│   ├── app/
+│   ├── alembic/
+│   └── Dockerfile
+└── web/
+    ├── app/
+    ├── components/
+    ├── lib/
+    └── Dockerfile
 
-.github/workflows/
-├── api-ci.yml
-└── web-ci.yml
+deploy/
+└── nginx/
+    ├── default.conf
+    └── host-risheh-pay.conf.example
 
-artifacts/
-└── review-redesign/
-    ├── rishehpayfixreviewredesign.patch
-    └── rishehpayfixreviewredesign.bundle
+scripts/
+├── deploy-prod.sh
+└── backup-postgres.sh
+
+docs/
+└── DEPLOYMENT_VPS_FA.md
+
+docker-compose.yml
+├── Development backend stack
+
+docker-compose.prod.yml
+└── Production full stack
 ```
 
 ---
@@ -83,40 +129,45 @@ artifacts/
 ## 🔐 Security & Reliability
 
 - جلوگیری از double-purchase و double-refund با State Machine، locking و idempotency
-- Encryption داده تحویلی در حالت at-rest با Fernet
+- Encryption داده تحویلی at-rest
 - Audit کردن reveal/access رویدادهای حساس
 - Admin API پشت API Key
 - Explicit CORS allow-list
 - Content Security Policy برای Web
-- Redis Rate Limiting با fail-open behavior
-- Integration tests برای endpointهای واقعی
+- PostgreSQL بدون public port
+- Redis بدون public port + password
+- Docker internal network برای data layer
+- `no-new-privileges` روی containerهای Production
 - Production build بدون `NEXT_PUBLIC_API_URL` fail می‌شود
-- قطع Backend در Production دیگر به Fake/Demo Order تبدیل نمی‌شود
+- Production deploy با Providerهای `mock` عمداً fail می‌شود
+- `SEED_DEMO_CATALOG=true` در `APP_ENV=production` عمداً API را متوقف می‌کند
+- Runtime backend outage به Fake/Demo Checkout تبدیل نمی‌شود
 
-هیچ Secret واقعی نباید داخل Git یا README ذخیره شود.
+هیچ Secret واقعی نباید داخل Git، README، issue یا artifact ذخیره شود.
 
 ---
 
 ## 🧪 Local Development
 
-### Full Stack
+### Backend stack
 
 ```bash
 docker compose up --build
 ```
 
-سرویس‌ها:
+سرویس‌های Development Compose:
 
 - API: `http://localhost:8000`
 - Swagger: `http://localhost:8000/docs`
-- Web: `http://localhost:3000`
+- PostgreSQL
+- Redis
 
-### Web only
+### Web
 
 ```bash
 cd apps/web
 npm ci
-npm run dev
+NEXT_PUBLIC_API_URL=http://localhost:8000 npm run dev
 ```
 
 ### API tests
@@ -129,9 +180,98 @@ pytest
 
 ---
 
-## 🚀 Vercel Production Deployment
+## 🚀 VPS Production Deployment
 
-Canonical setup پیشنهادی:
+راهنمای مرجع:
+
+**[`docs/DEPLOYMENT_VPS_FA.md`](docs/DEPLOYMENT_VPS_FA.md)**
+
+### 1. ساخت env
+
+```bash
+cp .env.production.example .env.production
+chmod 600 .env.production
+nano .env.production
+```
+
+### 2. اجرای Production Gate + Deploy
+
+```bash
+chmod +x scripts/deploy-prod.sh scripts/backup-postgres.sh
+./scripts/deploy-prod.sh
+```
+
+`deploy-prod.sh` انتشار را متوقف می‌کند اگر:
+
+- secret یا متغیر ضروری خالی باشد؛
+- placeholder از نوع `CHANGE_ME` باقی مانده باشد؛
+- `APP_ENV` برابر production نباشد؛
+- Demo Mode روشن باشد؛
+- Demo Catalog روشن باشد؛
+- Payment Provider برابر `mock` باشد؛
+- Digital Goods Provider برابر `mock` باشد؛
+- Compose validation یا healthcheck شکست بخورد.
+
+### 3. بررسی وضعیت
+
+```bash
+docker compose --env-file .env.production -f docker-compose.prod.yml ps
+curl http://127.0.0.1:8080/healthz
+```
+
+---
+
+## 💾 Backup
+
+```bash
+./scripts/backup-postgres.sh
+```
+
+Backupها به‌صورت gzip + SHA-256 در مسیر زیر ایجاد می‌شوند:
+
+```text
+backups/postgres/
+```
+
+Retention پیش‌فرض: **14 روز**.
+
+> برای Disaster Recovery حداقل یک نسخه backup باید خارج از همان VPS نگهداری شود.
+
+---
+
+## ⚙️ Environment Production
+
+حداقل متغیرهای حیاتی:
+
+```env
+APP_ENV=production
+SEED_DEMO_CATALOG=false
+NEXT_PUBLIC_ENABLE_DEMO_MODE=false
+
+POSTGRES_PASSWORD=<strong-secret>
+REDIS_PASSWORD=<strong-secret>
+DATABASE_URL=<production-url>
+REDIS_URL=<production-url>
+
+APP_SECRET_KEY=<strong-secret>
+DELIVERY_ENCRYPTION_KEY=<strong-secret>
+ADMIN_API_KEY=<strong-secret>
+
+NEXT_PUBLIC_API_URL=https://your-domain.example
+CORS_ORIGINS=["https://your-domain.example"]
+PAYMENT_CALLBACK_URL=https://your-domain.example/api/v1/payments/callback
+
+PAYMENT_PROVIDER=<real-provider>
+DIGITAL_GOODS_PROVIDER=<real-provider>
+```
+
+فایل مرجع: [`.env.production.example`](.env.production.example)
+
+---
+
+## 🌐 Frontend روی Vercel — اختیاری
+
+اگر Frontend به‌جای VPS روی Vercel قرار بگیرد:
 
 ```text
 Root Directory = apps/web
@@ -140,40 +280,14 @@ Install Command = npm ci
 Build Command = npm run build
 ```
 
-برای سازگاری با پروژه‌هایی که Root Directory هنوز روی repository root تنظیم شده، فایل `/vercel.json` نیز build را به `apps/web` هدایت می‌کند.
-
-### Environment Variables ضروری Web
+Environment:
 
 ```env
 NEXT_PUBLIC_API_URL=https://api.example.com
 NEXT_PUBLIC_ENABLE_DEMO_MODE=false
 ```
 
-قوانین:
-
-- `NEXT_PUBLIC_API_URL` در production اجباری است.
-- `NEXT_PUBLIC_ENABLE_DEMO_MODE=false` برای هر محیطی که پرداخت واقعی دارد الزامی است.
-- Demo Mode فقط برای Preview/Demo مستقل و با مقدار `true` قابل فعال‌سازی است.
-- Backend، PostgreSQL و Redis روی Vercel Frontend deploy نمی‌شوند و باید سرویس مستقل داشته باشند.
-
----
-
-## ⚙️ Backend Production Environment
-
-حداقل تنظیمات لازم:
-
-```env
-APP_ENV=production
-APP_SECRET_KEY=<strong-secret>
-DATABASE_URL=<production-postgres-url>
-REDIS_URL=<production-redis-url>
-CORS_ORIGINS=["https://your-frontend-domain"]
-DELIVERY_ENCRYPTION_KEY=<strong-secret>
-ADMIN_API_KEY=<strong-secret>
-PAYMENT_CALLBACK_URL=https://api.example.com/api/v1/payments/callback
-```
-
-در صورت استفاده از Provider و Payment واقعی، credentialهای مربوط نیز فقط از Secret Manager / Environment دریافت شوند.
+Backend، PostgreSQL و Redis همچنان باید سرویس مستقل داشته باشند.
 
 ---
 
@@ -181,45 +295,53 @@ PAYMENT_CALLBACK_URL=https://api.example.com/api/v1/payments/callback
 
 | Layer | Technology |
 |---|---|
-| Frontend | Next.js, React, TypeScript, Tailwind CSS |
-| Backend | FastAPI, Python |
-| Database | PostgreSQL |
-| Cache / Rate Limit | Redis |
+| Frontend | Next.js 15, React 19, TypeScript, Tailwind CSS |
+| Backend | FastAPI, Python 3.12 |
+| Database | PostgreSQL 17 |
+| Cache / Rate Limit | Redis 7 |
 | Migrations | Alembic |
 | Delivery Security | Fernet / Cryptography |
-| Infrastructure | Docker Compose |
-| Frontend Hosting | Vercel |
+| Containers | Docker + Docker Compose |
+| Reverse Proxy | Nginx |
+| TLS | Let's Encrypt / Certbot |
 | CI | GitHub Actions |
 
 ---
 
-## ✅ Production Checklist
+## ✅ Production Gate
 
-- [ ] `NEXT_PUBLIC_API_URL` روی Vercel Production تنظیم شده
-- [ ] `NEXT_PUBLIC_ENABLE_DEMO_MODE=false` روی Production تنظیم شده
-- [ ] Secretها در Environment/Secret Manager تنظیم شده‌اند
-- [ ] `DELIVERY_ENCRYPTION_KEY` تولید و امن نگهداری شده
-- [ ] `ADMIN_API_KEY` روی Production تنظیم شده
-- [ ] CORS فقط Origin واقعی Frontend را مجاز می‌کند
-- [ ] PostgreSQL migration روی دیتابیس تمیز تست شده
-- [ ] Redis availability بررسی شده
-- [ ] API Integration Tests پاس شده‌اند
-- [ ] Web build و smoke test پاس شده‌اند
+قبل از فعال‌کردن پرداخت واقعی:
+
+- [ ] Domain و HTTPS معتبر
+- [ ] تمام secretها واقعی و خارج Git
+- [ ] `SEED_DEMO_CATALOG=false`
+- [ ] `NEXT_PUBLIC_ENABLE_DEMO_MODE=false`
+- [ ] Payment Provider واقعی
+- [ ] Digital Goods Provider واقعی
+- [ ] CORS محدود به دامنه واقعی
+- [ ] PostgreSQL migration موفق
+- [ ] همه containerها Healthy
 - [ ] Payment callback روی دامنه واقعی تست شده
-- [ ] Backup، monitoring و alerting فعال شده‌اند
-- [ ] Runtime backend outage باعث Demo Checkout نمی‌شود
+- [ ] Sandbox payment end-to-end موفق
+- [ ] Duplicate callback / Idempotency تست شده
+- [ ] Fulfillment failure / Retry تست شده
+- [ ] Backup موفق
+- [ ] Restore آزمایشی موفق
+- [ ] Monitoring و Alerting فعال
+
+تا قبل از پاس شدن این Gateها محیط باید **Staging** در نظر گرفته شود، نه Production مالی.
 
 ---
 
 ## 🧩 Review / Redesign Handoff Artifacts
 
-نسخه‌های Patch و Bundle مربوط به مرحله Fix + Review + Redesign داخل این مسیر نگهداری می‌شوند:
+Artifactهای Audit و Recovery در این مسیر نگهداری می‌شوند:
 
 ```text
 artifacts/review-redesign/
 ```
 
-این artifactها برای recovery، audit و handoff هستند و تغییرات اصلی آن‌ها قبلاً روی `main` اعمال شده است؛ برای اجرای عادی پروژه نیازی به apply مجدد آن‌ها نیست.
+برای اجرای عادی پروژه نیازی به apply مجدد آن‌ها نیست.
 
 ---
 
